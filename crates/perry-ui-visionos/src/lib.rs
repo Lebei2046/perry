@@ -4,6 +4,8 @@ pub mod camera;
 pub mod clipboard;
 pub mod crash_log;
 pub mod file_dialog;
+#[cfg(feature = "geisterhand")]
+pub mod geisterhand_style;
 pub mod location;
 pub mod menu;
 pub mod screenshot;

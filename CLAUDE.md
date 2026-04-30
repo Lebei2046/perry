@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Perry is a native TypeScript compiler written in Rust that compiles TypeScript source code directly to native executables. It uses SWC for TypeScript parsing and LLVM for code generation.
 
-**Current Version:** 0.5.403
+**Current Version:** 0.5.404
 
 ## TypeScript Parity Status
 
@@ -149,6 +149,7 @@ First-resolved directory cached in `compile_package_dirs`; subsequent imports re
 
 Keep entries to 1-2 lines max. Full details in CHANGELOG.md.
 
+- **v0.5.404** — Closes #242: visionOS now registers the full geisterhand fn-pointer block (state_set / screenshot / textfield / scroll / read_value / query_tree / apply_style) — Phase D is fully cross-platform on every Apple target Perry supports (macOS / iOS / tvOS / visionOS).
 - **v0.5.403** — Closes #309: `perry compile` of a 4-line program importing the `effect` package OOM'd at **34 GB RSS / 249 GB peak virtual** before being SIGKILL'd ~7 minutes in, during the `Generating code...` phase.
 - **v0.5.402** — Closes #311: `for...of` on a Map/Set held as a property of a plain object literal OR a class instance silently iterated zero times.
 - **v0.5.401** — HarmonyOS Phase 2 v1.5: full widget set in `perry-codegen-arkts`.
