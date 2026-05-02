@@ -975,6 +975,9 @@ pub extern "C" fn gc_check_trigger_export() {
 /// parity test corpus.
 pub fn gc_collect_minor() -> u64 {
     let start = std::time::Instant::now();
+    // MARK_SEEDS persists across GC cycles. Clear before any try_mark
+    // call so trace sees only this cycle's freshly-marked headers.
+    clear_mark_seeds();
     let valid_ptrs = build_valid_pointer_set();
 
     // === MARK PHASE (minor) ===
@@ -1163,6 +1166,9 @@ fn gc_collect_inner() -> u64 {
     }
     let start = std::time::Instant::now();
 
+    // MARK_SEEDS persists across GC cycles. Clear before any try_mark
+    // call so trace sees only this cycle's freshly-marked headers.
+    clear_mark_seeds();
     // Build set of valid heap pointers for conservative stack scan validation
     let valid_ptrs = build_valid_pointer_set();
 
@@ -1340,6 +1346,44 @@ unsafe fn header_from_user_ptr(user_ptr: *const u8) -> *mut GcHeader {
 }
 
 /// Try to mark a value (if it's a heap pointer). Returns true if newly marked.
+// === MARK_SEEDS ===
+// Per-cycle worklist populated by `try_mark_value` /
+// `try_mark_value_or_raw` whenever they newly mark an object. The
+// `trace_marked_objects[_minor]` entry points then drain this list
+// instead of doing a full arena walk to find marked headers — saving
+// ~10 ms per cycle in perf-comprehensive (1.6M objects/cycle).
+//
+// Re-entrant pushes during trace are fine: trace functions also push
+// the newly-marked header onto their LOCAL worklist (the one
+// `drain_trace_worklist_inner` is iterating), which is the path the
+// drain actually consumes. The seeds list keeps accumulating during
+// trace — those duplicate entries are harmless because either the
+// next `take_mark_seeds()` call clears them, or the next GC cycle
+// starts with `clear_mark_seeds()`.
+thread_local! {
+    static MARK_SEEDS: std::cell::UnsafeCell<Vec<*mut GcHeader>> =
+        std::cell::UnsafeCell::new(Vec::new());
+}
+
+#[inline(always)]
+fn push_mark_seed(header: *mut GcHeader) {
+    MARK_SEEDS.with(|cell| unsafe {
+        (*cell.get()).push(header);
+    });
+}
+
+#[inline]
+fn take_mark_seeds() -> Vec<*mut GcHeader> {
+    MARK_SEEDS.with(|cell| unsafe { std::mem::take(&mut *cell.get()) })
+}
+
+#[inline]
+fn clear_mark_seeds() {
+    MARK_SEEDS.with(|cell| unsafe {
+        (*cell.get()).clear();
+    });
+}
+
 fn try_mark_value(value_bits: u64, valid_ptrs: &ValidPointerSet) -> bool {
     let tag = value_bits & TAG_MASK;
     let ptr_val = (value_bits & POINTER_MASK) as usize;
@@ -1376,6 +1420,7 @@ fn try_mark_value(value_bits: u64, valid_ptrs: &ValidPointerSet) -> bool {
             return false; // Pinned objects are always live
         }
         (*header).gc_flags |= GC_FLAG_MARKED;
+        push_mark_seed(header);
         true
     }
 }
@@ -1532,6 +1577,7 @@ fn try_mark_value_or_raw(word: u64, valid_ptrs: &ValidPointerSet) -> bool {
             return false; // Pinned objects are always live
         }
         (*header).gc_flags |= GC_FLAG_MARKED;
+        push_mark_seed(header);
     }
     true
 }
@@ -1812,61 +1858,24 @@ fn drain_trace_worklist_inner(
 
 /// Trace from marked objects: follow references iteratively using a worklist.
 fn trace_marked_objects(valid_ptrs: &ValidPointerSet) {
-    // Collect all currently-marked objects into a worklist
-    let mut worklist: Vec<*mut GcHeader> = Vec::new();
-
-    // Arena objects
-    crate::arena::arena_walk_objects(|header_ptr| {
-        let header = header_ptr as *mut GcHeader;
-        unsafe {
-            if (*header).gc_flags & GC_FLAG_MARKED != 0 {
-                worklist.push(header);
-            }
-        }
-    });
-
-    // Malloc objects
-    MALLOC_STATE.with(|s| {
-        let s = s.borrow();
-        for &header in s.objects.iter() {
-            unsafe {
-                if (*header).gc_flags & GC_FLAG_MARKED != 0 {
-                    worklist.push(header);
-                }
-            }
-        }
-    });
-
+    // Same MARK_SEEDS-based approach as the minor variant — root scans
+    // populated `MARK_SEEDS` via `try_mark_value`, no need to walk arena
+    // here just to gather them.
+    let mut worklist = take_mark_seeds();
     drain_trace_worklist(&mut worklist, valid_ptrs);
 }
 
 /// Gen-GC Phase C3b minor variant of `trace_marked_objects`.
-/// Builds the same worklist (every currently-marked header) but
-/// drains it via `drain_trace_worklist_minor` — recursion into
-/// old-gen objects is skipped. The old-gen objects themselves
-/// stay marked (so subsequent walks see them as live), but their
-/// fields aren't visited; any young child held by an old-gen
-/// object reaches the worklist via the remembered set instead.
+/// Drains the per-cycle MARK_SEEDS worklist that root-marking
+/// populated via `try_mark_value` / `try_mark_value_or_raw` —
+/// recursion into old-gen objects is skipped. The seeds list
+/// avoids the full arena walk that the previous implementation
+/// did just to find currently-marked headers; with ~1.6M objects
+/// per cycle in perf-comprehensive that walk dominated minor-GC
+/// time and produced output containing only the small number of
+/// objects the root scan actually touched.
 fn trace_marked_objects_minor(valid_ptrs: &ValidPointerSet) {
-    let mut worklist: Vec<*mut GcHeader> = Vec::new();
-    crate::arena::arena_walk_objects(|header_ptr| {
-        let header = header_ptr as *mut GcHeader;
-        unsafe {
-            if (*header).gc_flags & GC_FLAG_MARKED != 0 {
-                worklist.push(header);
-            }
-        }
-    });
-    MALLOC_STATE.with(|s| {
-        let s = s.borrow();
-        for &header in s.objects.iter() {
-            unsafe {
-                if (*header).gc_flags & GC_FLAG_MARKED != 0 {
-                    worklist.push(header);
-                }
-            }
-        }
-    });
+    let mut worklist = take_mark_seeds();
     drain_trace_worklist_minor(&mut worklist, valid_ptrs);
 }
 
