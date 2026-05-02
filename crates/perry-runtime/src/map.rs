@@ -292,8 +292,29 @@ pub extern "C" fn js_map_size(map: *const MapHeader) -> u32 {
 /// Uses the O(1) MAP_INDEX side-table; falls back to a linear scan only
 /// when no side-table entry exists (e.g. a Map produced by a path that
 /// bypassed `js_map_alloc`).
+/// Below this size, linear scan over the entries buffer beats the
+/// side-table lookup (RefCell::borrow + HashMap::get is ~100ns per
+/// call; a linear scan over <=8 f64 keys is ~10-20ns + better cache
+/// locality). Most archetype.componentData / per-entity-relations Maps
+/// hold 1-3 entries — paying the side-table cost on them dominates
+/// the perf-comprehensive sync-heavy benchmarks.
+const SIDE_TABLE_THRESHOLD: u32 = 8;
+
 unsafe fn find_key_index(map: *const MapHeader, key: f64) -> i32 {
     let size = (*map).size;
+
+    // Small maps: linear scan beats side-table dispatch.
+    if size <= SIDE_TABLE_THRESHOLD {
+        let entries = entries_ptr(map);
+        for i in 0..size {
+            let entry_key = ptr::read(entries.add((i as usize) * 2));
+            if jsvalue_eq(entry_key, key) {
+                return i as i32;
+            }
+        }
+        return -1;
+    }
+
     let resolved = MAP_INDEX.with(|idx| {
         let idx = idx.borrow();
         if let Some(slot) = idx.get(&(map as usize)) {
