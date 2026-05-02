@@ -26,45 +26,58 @@ pub fn is_registered_map(addr: usize) -> bool {
     MAP_REGISTRY.with(|r| r.borrow().contains(&addr))
 }
 
-/// A wrapper around f64 JSValues that implements Hash and Eq using
-/// content-based comparison for strings (matching `jsvalue_eq` semantics).
-/// Mirrors the same JSValueKey pattern used by `set.rs`.
-#[derive(Clone)]
-struct JSValueKey(f64);
+/// Numeric-key index entry: hashed/compared by raw f64 bits only.
+/// Strings/object-pointer keys are NOT inserted here — those still go
+/// through the linear-scan fallback in `find_key_index`. The reason is
+/// that gen-GC may forward a string/object behind a Map.entries slot,
+/// and the entries-array gets rewritten via `rewrite_map_fields`, but
+/// the side-table's stored f64 bits for that key go stale. A subsequent
+/// lookup that triggers `jsvalue_eq` on the stale bits would deref
+/// freed memory (string content compare). Numeric f64 values have no
+/// pointers, so they're safe to index by bits.
+#[derive(Clone, Copy)]
+struct NumericKey(u64);
 
-impl Hash for JSValueKey {
+impl Hash for NumericKey {
+    #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        let bits = self.0.to_bits();
-        let ptr = extract_string_ptr_from_value(bits);
-        if !ptr.is_null() && (ptr as usize) >= 0x1000 {
-            // String value: hash by content so identical strings with
-            // different pointers/tags produce the same hash.
-            unsafe {
-                let len = (*ptr).byte_len;
-                0xFFFF_FFFFu32.hash(state);
-                len.hash(state);
-                let data = (ptr as *const u8).add(std::mem::size_of::<StringHeader>());
-                let slice = std::slice::from_raw_parts(data, len as usize);
-                slice.hash(state);
-            }
-        } else {
-            bits.hash(state);
+        self.0.hash(state);
+    }
+}
+
+impl PartialEq for NumericKey {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+impl Eq for NumericKey {}
+
+/// `true` if `bits` is a non-pointer JSValue (number, bool, undefined,
+/// null, INT32, SSO, or any NaN-tagged value that is NOT a heap pointer).
+/// We index only these in the side-table.
+#[inline]
+fn is_safe_numeric_key(bits: u64) -> bool {
+    let upper = bits >> 48;
+    // STRING_TAG (0x7FFF), POINTER_TAG (0x7FFD), BIGINT_TAG (0x7FFE) are pointers.
+    if upper == 0x7FFF || upper == 0x7FFD || upper == 0x7FFE {
+        return false;
+    }
+    // Raw pointer (0x0000) with a plausible heap address is also a pointer.
+    if upper == 0x0000 {
+        let lower = bits & 0x0000_FFFF_FFFF_FFFF;
+        if lower > 0x10000 {
+            return false;
         }
     }
+    true
 }
 
-impl PartialEq for JSValueKey {
-    fn eq(&self, other: &Self) -> bool {
-        jsvalue_eq(self.0, other.0)
-    }
-}
-impl Eq for JSValueKey {}
-
-/// Side-table mapping `map_ptr -> (JSValueKey -> entries-array-index)`.
-/// O(1) `find_key_index` instead of an O(N) linear scan over the
-/// entries buffer. Identical pattern to `set.rs::SET_INDEX`.
+/// Side-table mapping `map_ptr -> (NumericKey-bits -> entries-array-index)`.
+/// O(1) `find_key_index` for numeric keys; pointer keys still take the
+/// linear-scan path so they remain correct under gen-GC string forwarding.
 thread_local! {
-    static MAP_INDEX: RefCell<HashMap<usize, HashMap<JSValueKey, u32>>> =
+    static MAP_INDEX: RefCell<HashMap<usize, HashMap<NumericKey, u32>>> =
         RefCell::new(HashMap::new());
 }
 
@@ -302,6 +315,7 @@ const SIDE_TABLE_THRESHOLD: u32 = 8;
 
 unsafe fn find_key_index(map: *const MapHeader, key: f64) -> i32 {
     let size = (*map).size;
+    let key_bits = key.to_bits();
 
     // Small maps: linear scan beats side-table dispatch.
     if size <= SIDE_TABLE_THRESHOLD {
@@ -315,23 +329,29 @@ unsafe fn find_key_index(map: *const MapHeader, key: f64) -> i32 {
         return -1;
     }
 
-    let resolved = MAP_INDEX.with(|idx| {
-        let idx = idx.borrow();
-        if let Some(slot) = idx.get(&(map as usize)) {
-            if let Some(&i) = slot.get(&JSValueKey(key)) {
-                if i < size {
-                    return Some(i as i32);
+    // Side-table fast path is restricted to non-pointer keys. String /
+    // object / bigint keys still take the linear scan because the
+    // side-table's stored bits go stale when gen-GC forwards the
+    // backing object (see comment on `NumericKey`).
+    if is_safe_numeric_key(key_bits) {
+        let hit = MAP_INDEX.with(|idx| {
+            let idx = idx.borrow();
+            if let Some(slot) = idx.get(&(map as usize)) {
+                if let Some(&i) = slot.get(&NumericKey(key_bits)) {
+                    if i < size {
+                        return Some(i as i32);
+                    }
                 }
+                return Some(-1i32);
             }
-            return Some(-1i32);
+            None
+        });
+        if let Some(v) = hit {
+            return v;
         }
-        None
-    });
-    if let Some(v) = resolved {
-        return v;
     }
 
-    // Cold fallback: no side-table entry. Linear scan.
+    // Linear scan for pointer keys, or maps with no side-table entry.
     let entries = entries_ptr(map);
     for i in 0..size {
         let entry_key = ptr::read(entries.add((i as usize) * 2));
@@ -396,12 +416,17 @@ pub extern "C" fn js_map_set(map: *mut MapHeader, key: f64, value: f64) -> *mut 
 
         (*map).size = size + 1;
 
-        // Update O(1) side-table.
-        MAP_INDEX.with(|idx| {
-            let mut idx = idx.borrow_mut();
-            let slot = idx.entry(map as usize).or_insert_with(HashMap::new);
-            slot.insert(JSValueKey(key), size);
-        });
+        // Update O(1) side-table for numeric keys only. Pointer keys
+        // (strings/objects/bigints) stay out so a gen-GC forward of the
+        // backing object can't leave stale bits in the index.
+        let key_bits = key.to_bits();
+        if is_safe_numeric_key(key_bits) {
+            MAP_INDEX.with(|idx| {
+                let mut idx = idx.borrow_mut();
+                let slot = idx.entry(map as usize).or_insert_with(HashMap::new);
+                slot.insert(NumericKey(key_bits), size);
+            });
+        }
 
         map
     }
@@ -478,19 +503,29 @@ pub extern "C" fn js_map_delete(map: *mut MapHeader, key: f64) -> i32 {
 
         (*map).size = size - 1;
 
-        // Update side-table: drop the deleted key; if we swap-popped, patch
-        // the swapped key's stored index to its new position.
-        MAP_INDEX.with(|midx| {
-            let mut midx = midx.borrow_mut();
-            if let Some(slot) = midx.get_mut(&(map as usize)) {
-                slot.remove(&JSValueKey(key));
-                if let Some(sk) = swapped_key {
-                    if let Some(entry) = slot.get_mut(&JSValueKey(sk)) {
-                        *entry = idx as u32;
+        // Update side-table: drop the deleted key (if it was indexed),
+        // and if we swap-popped, patch the swapped key's stored index.
+        let key_bits = key.to_bits();
+        let swapped_bits = swapped_key.map(|f| f.to_bits());
+        if is_safe_numeric_key(key_bits)
+            || swapped_bits.map(is_safe_numeric_key).unwrap_or(false)
+        {
+            MAP_INDEX.with(|midx| {
+                let mut midx = midx.borrow_mut();
+                if let Some(slot) = midx.get_mut(&(map as usize)) {
+                    if is_safe_numeric_key(key_bits) {
+                        slot.remove(&NumericKey(key_bits));
+                    }
+                    if let Some(sb) = swapped_bits {
+                        if is_safe_numeric_key(sb) {
+                            if let Some(entry) = slot.get_mut(&NumericKey(sb)) {
+                                *entry = idx as u32;
+                            }
+                        }
                     }
                 }
-            }
-        });
+            });
+        }
         1
     }
 }
