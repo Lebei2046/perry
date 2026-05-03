@@ -2332,6 +2332,18 @@ pub(crate) fn lower_class_method(
         .map(|rt| extract_ts_type_with_ctx(&rt.type_ann, Some(ctx)))
         .unwrap_or(Type::Any);
 
+    // Pre-register the explicit-annotated return type BEFORE lowering the
+    // body so a sibling method appearing later in the class (or this method
+    // calling itself recursively) can resolve `this.method()` through
+    // `infer_call_return_type`. The post-loop registration in
+    // `lower_class_decl` only sees lowered methods, which is too late for
+    // intra-class call-site inference inside the body we're about to lower.
+    if has_explicit_return_annotation && !matches!(return_type, Type::Any) {
+        if let Some(class_name) = ctx.current_class.clone() {
+            ctx.register_class_method_return_type(class_name, name.clone(), return_type.clone());
+        }
+    }
+
     // Lower body
     let mut body = if let Some(ref block) = method.function.body {
         lower_block_stmt(ctx, block)?

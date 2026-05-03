@@ -291,6 +291,18 @@ pub(crate) fn infer_type_from_expr(expr: &ast::Expr, ctx: &LoweringContext) -> T
             }
         }
 
+        // `this` inside a class method → Type::Named(<current class>) so
+        // sibling-method calls (`this.foo()`) and field access (`this.x`)
+        // can resolve through the Named-receiver paths in
+        // `infer_call_return_type` and the Member arm above. Falls back to
+        // Type::Any outside a class context (top-level / arrow with no
+        // enclosing method — already legal under the existing catch-all).
+        ast::Expr::This(_) => ctx
+            .current_class
+            .as_ref()
+            .map(|c| Type::Named(c.clone()))
+            .unwrap_or(Type::Any),
+
         // Arrow/function expressions
         ast::Expr::Arrow(arrow) => {
             // Phase 4 (expansion): when the arrow has no explicit return

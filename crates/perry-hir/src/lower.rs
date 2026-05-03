@@ -821,9 +821,26 @@ impl LoweringContext {
             return existing.clone();
         }
 
-        let anon_id = self.next_anon_shape_id;
-        self.next_anon_shape_id += 1;
-        let class_name = format!("__AnonShape_{}", anon_id);
+        // Content-addressed name: FNV-1a hash of the canonical shape_key.
+        // Same shape across different modules produces the same name, so
+        // cross-module method inlining (which copies a body verbatim into
+        // a sibling module) doesn't accidentally bind to a same-named but
+        // different-shaped class in the destination.
+        //
+        // The pre-fix scheme (`__AnonShape_<per-module-counter>`) collided
+        // when two modules each minted a class for their own first
+        // closed-shape literal — both got `__AnonShape_0` for unrelated
+        // shapes, and the inliner's body-rewrite resolved the cross-module
+        // reference to the destination's local `__AnonShape_0`. Symptom:
+        // a 4-field command literal in `CommandBuffer.set` round-tripped
+        // as a 2-field component literal `{ x, y }`, silently dropping
+        // `entityId` / `componentType` and producing 0 entities post-sync.
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in shape_key.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        let class_name = format!("__AnonShape_{:016x}", h);
         let class_id = self.fresh_class();
 
         // Fields have `init: None` — each literal's values are passed as

@@ -4,7 +4,7 @@
 //! call overhead and enable further optimizations.
 
 use perry_hir::walker::{walk_expr_children, walk_expr_children_mut};
-use perry_hir::{BinaryOp, Expr, Function, Module, Stmt};
+use perry_hir::{BinaryOp, Class, Expr, Function, Module, Stmt};
 use perry_types::{FuncId, LocalId, Type};
 use std::collections::{HashMap, HashSet};
 
@@ -43,7 +43,137 @@ pub fn inline_functions(
     module: &mut Module,
     extra_methods: &HashMap<(String, String), MethodCandidate>,
     extra_class_fields: &HashMap<(String, String), String>,
+    extra_anon_classes: &HashMap<String, Class>,
 ) {
+    // ── Cross-module anon-class propagation ──
+    // Anon-shape classes (`__AnonShape_<hash>`) are content-addressed by
+    // their canonical shape key, so the same shape across modules produces
+    // the same name. But each source module materializes its own class
+    // definition and the cross-module method inliner copies bodies that
+    // reference these classes by name. If the destination module never
+    // synthesized that shape itself, codegen later finds no class entry
+    // for `__AnonShape_<hash>` and falls into a generic-object path —
+    // which silently drops fields (the symptom that masked
+    // `world.query([T]).length === 0` after `world.sync()`).
+    //
+    // Pull in every anon class referenced by any cross-module-inlinable
+    // candidate that the destination module hasn't already synthesized
+    // locally. Hash-named, so dedup is by-name and definitionally safe.
+    {
+        use perry_hir::walker::walk_expr_children;
+        fn collect_anon_refs(stmts: &[Stmt], out: &mut HashSet<String>) {
+            for s in stmts {
+                walk_stmt_exprs(s, &mut |e| collect_anon_refs_in_expr(e, out));
+            }
+        }
+        fn collect_anon_refs_in_expr(e: &Expr, out: &mut HashSet<String>) {
+            if let Expr::New { class_name, .. } = e {
+                if class_name.starts_with("__AnonShape_") {
+                    out.insert(class_name.clone());
+                }
+            }
+            walk_expr_children(e, &mut |c| collect_anon_refs_in_expr(c, out));
+        }
+        fn walk_stmt_exprs(s: &Stmt, f: &mut impl FnMut(&Expr)) {
+            match s {
+                Stmt::Let { init, .. } => {
+                    if let Some(e) = init {
+                        f(e);
+                    }
+                }
+                Stmt::Expr(e) | Stmt::Throw(e) | Stmt::Return(Some(e)) => f(e),
+                Stmt::Return(None) | Stmt::Break | Stmt::Continue => {}
+                Stmt::LabeledBreak(_) | Stmt::LabeledContinue(_) => {}
+                Stmt::If {
+                    condition,
+                    then_branch,
+                    else_branch,
+                } => {
+                    f(condition);
+                    for s in then_branch {
+                        walk_stmt_exprs(s, f);
+                    }
+                    if let Some(eb) = else_branch {
+                        for s in eb {
+                            walk_stmt_exprs(s, f);
+                        }
+                    }
+                }
+                Stmt::While { condition, body } | Stmt::DoWhile { body, condition } => {
+                    f(condition);
+                    for s in body {
+                        walk_stmt_exprs(s, f);
+                    }
+                }
+                Stmt::For {
+                    init,
+                    condition,
+                    update,
+                    body,
+                } => {
+                    if let Some(s) = init {
+                        walk_stmt_exprs(s, f);
+                    }
+                    if let Some(c) = condition {
+                        f(c);
+                    }
+                    if let Some(u) = update {
+                        f(u);
+                    }
+                    for s in body {
+                        walk_stmt_exprs(s, f);
+                    }
+                }
+                Stmt::Switch { discriminant, cases } => {
+                    f(discriminant);
+                    for c in cases {
+                        if let Some(t) = &c.test {
+                            f(t);
+                        }
+                        for s in &c.body {
+                            walk_stmt_exprs(s, f);
+                        }
+                    }
+                }
+                Stmt::Try {
+                    body,
+                    catch,
+                    finally,
+                } => {
+                    for s in body {
+                        walk_stmt_exprs(s, f);
+                    }
+                    if let Some(c) = catch {
+                        for s in &c.body {
+                            walk_stmt_exprs(s, f);
+                        }
+                    }
+                    if let Some(fi) = finally {
+                        for s in fi {
+                            walk_stmt_exprs(s, f);
+                        }
+                    }
+                }
+                Stmt::Labeled { body, .. } => walk_stmt_exprs(body.as_ref(), f),
+            }
+        }
+
+        let mut needed: HashSet<String> = HashSet::new();
+        for cand in extra_methods.values() {
+            collect_anon_refs(&cand.func.body, &mut needed);
+        }
+        let already_present: HashSet<String> =
+            module.classes.iter().map(|c| c.name.clone()).collect();
+        for name in &needed {
+            if already_present.contains(name) {
+                continue;
+            }
+            if let Some(src_cls) = extra_anon_classes.get(name) {
+                module.classes.push(src_cls.clone());
+            }
+        }
+    }
+
     // Phases 0 + 1 fused (Tier 4.1, v0.5.335): single iteration over
     // module.functions collects both Math.imul polyfill ids AND
     // inlinable-function candidates. Pre-Tier-4 these were two separate
@@ -542,6 +672,22 @@ pub fn is_cross_module_safe(body: &[Stmt]) -> bool {
 /// frontier gate) make it into the result. Constructors, getters, setters,
 /// and static methods are excluded — those have either non-trivial dispatch
 /// semantics or a class-tied receiver that cross-module callers can't supply.
+/// Harvest content-addressed anon-shape classes (`__AnonShape_<hash>`)
+/// from a module. The driver merges these across all prior modules and
+/// passes the result to `inline_functions` as `extra_anon_classes` so the
+/// destination module gets any class definitions referenced by inlined
+/// cross-module method bodies. Hash naming makes dedup-by-name correct
+/// (same shape from any module → same name → identical class definition).
+pub fn gather_cross_module_anon_classes(module: &Module) -> HashMap<String, Class> {
+    let mut out: HashMap<String, Class> = HashMap::new();
+    for class in &module.classes {
+        if class.name.starts_with("__AnonShape_") {
+            out.insert(class.name.clone(), class.clone());
+        }
+    }
+    out
+}
+
 pub fn gather_cross_module_methods(
     module: &Module,
 ) -> HashMap<(String, String), MethodCandidate> {

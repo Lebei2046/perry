@@ -12,8 +12,9 @@
 use anyhow::{anyhow, Result};
 use perry_hir::ModuleKind;
 use perry_transform::{
-    gather_cross_module_methods, gather_cross_module_methods_with_extern_imports,
-    inline_functions, transform_async_to_generator, transform_generators, MethodCandidate,
+    gather_cross_module_anon_classes, gather_cross_module_methods,
+    gather_cross_module_methods_with_extern_imports, inline_functions,
+    transform_async_to_generator, transform_generators, MethodCandidate,
 };
 use std::collections::HashSet;
 use std::fs;
@@ -543,7 +544,28 @@ pub(super) fn collect_modules(
                 }
             }
         }
-        inline_functions(&mut hir_module, &extra_methods, &extra_class_fields);
+        // Cross-module anon-shape classes. Names are content-addressed
+        // (FNV-1a hash of the canonical shape key), so dedup-by-name across
+        // modules is correct: any two modules that synthesized a class for
+        // the same closed-shape literal end up with byte-identical class
+        // definitions under the same name. Required so that when
+        // `inline_functions` copies a method body referencing
+        // `__AnonShape_<hash>` into this module, codegen can resolve the
+        // class definition (otherwise the field list is missing and the
+        // literal lowers as a bare object with all properties dropped).
+        let mut extra_anon_classes: std::collections::HashMap<String, perry_hir::Class> =
+            std::collections::HashMap::new();
+        for prior_module in ctx.native_modules.values() {
+            for (k, v) in gather_cross_module_anon_classes(prior_module) {
+                extra_anon_classes.entry(k).or_insert(v);
+            }
+        }
+        inline_functions(
+            &mut hir_module,
+            &extra_methods,
+            &extra_class_fields,
+            &extra_anon_classes,
+        );
         transform_async_to_generator(&mut hir_module);
         transform_generators(&mut hir_module);
     }
