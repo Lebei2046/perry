@@ -1465,6 +1465,18 @@ fn expr_preserves_array_length(e: &perry_hir::Expr, arr_id: u32, bounded_idx_id:
         Expr::Uint8ArraySet { array, index, value } => walk(array) && walk(index) && walk(value),
         Expr::BufferIndexGet { buffer, index } => walk(buffer) && walk(index),
         Expr::BufferIndexSet { buffer, index, value } => walk(buffer) && walk(index) && walk(value),
+        // Pure arithmetic intrinsics — `Math.imul(a, b)` lowers to
+        // `Expr::MathImul`, `Math.abs/sqrt/pow/floor/ceil/round` etc. all
+        // bottom out as numeric ops with no side effects on the bounded
+        // array. image_conv's FNV-1a body uses Math.imul and was rejecting
+        // the peephole until this arm landed.
+        Expr::MathImul(a, b) | Expr::MathPow(a, b) => walk(a) && walk(b),
+        Expr::MathMin(elems) | Expr::MathMax(elems) => elems.iter().all(&walk),
+        Expr::MathAbs(a)
+        | Expr::MathSqrt(a)
+        | Expr::MathFloor(a)
+        | Expr::MathCeil(a)
+        | Expr::MathRound(a) => walk(a),
         Expr::Array(elements) => elements.iter().all(&walk),
         Expr::ArraySpread(elements) => elements.iter().all(|el| match el {
             ArrayElement::Expr(e) | ArrayElement::Spread(e) => walk(e),
@@ -1472,6 +1484,7 @@ fn expr_preserves_array_length(e: &perry_hir::Expr, arr_id: u32, bounded_idx_id:
         Expr::Object(fields) => fields.iter().all(|(_, v)| walk(v)),
         Expr::LocalGet(_)
         | Expr::GlobalGet(_)
+        | Expr::FuncRef(_)
         | Expr::Number(_)
         | Expr::Integer(_)
         | Expr::Bool(_)
