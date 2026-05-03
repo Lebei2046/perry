@@ -667,6 +667,62 @@ pub fn arena_in_use_bytes() -> usize {
 /// Walk all GcHeader objects in arena blocks linearly (general arena +
 /// longlived arena, in that order — block indices are global with
 /// general blocks occupying `0..general_block_count()`).
+/// Walk all GC objects across all 3 arenas in ascending data-pointer
+/// (block-address) order. Used by `gc::build_valid_pointer_set` so the
+/// resulting pointer stream is a single sorted run instead of K
+/// (≈ block-count) interspersed sorted runs — the final `sort()` then
+/// only has to in-place insertion-sort the small unsorted malloc tail
+/// and run one O(N) merge, dropping driftsort's K-way-merge phase
+/// (≈ 19 % of total runtime in ECS perf-comprehensive).
+///
+/// Sorting the (small) block list is microseconds (~200 entries on the
+/// ECS bench); the saved sort work over 1.6 M user pointers is on the
+/// order of N · log K cache-line-sized comparisons.
+pub fn arena_walk_objects_addr_sorted(mut callback: impl FnMut(*mut u8)) {
+    use crate::gc::GcHeader;
+
+    sync_inline_arena_state();
+
+    // Collect (data, block.offset, block.size) for every non-tombstone
+    // block across all 3 arenas. Using usize for `data` so we can sort
+    // by address; cast back to *mut u8 when walking.
+    let mut blocks: Vec<(usize, usize, usize)> = Vec::new();
+    let collect = |arena: &Arena, blocks: &mut Vec<(usize, usize, usize)>| {
+        for b in &arena.blocks {
+            if !b.data.is_null() {
+                blocks.push((b.data as usize, b.offset, b.size));
+            }
+        }
+    };
+    ARENA.with(|a| unsafe { collect(&*a.get(), &mut blocks) });
+    LONGLIVED_ARENA.with(|a| unsafe { collect(&*a.get(), &mut blocks) });
+    OLD_ARENA.with(|a| unsafe { collect(&*a.get(), &mut blocks) });
+    blocks.sort_unstable_by_key(|&(d, _, _)| d);
+
+    for (data, block_offset, block_size) in blocks {
+        let mut offset = 0usize;
+        while offset < block_offset {
+            let aligned = (offset + 7) & !7;
+            if aligned >= block_offset {
+                break;
+            }
+            let header_ptr = (data + aligned) as *mut u8;
+            let header = header_ptr as *const GcHeader;
+            unsafe {
+                let total_size = (*header).size as usize;
+                if total_size == 0 || total_size > block_size {
+                    break;
+                }
+                let obj_type = (*header).obj_type;
+                if (1..=9).contains(&obj_type) {
+                    callback(header_ptr);
+                }
+                offset = aligned + total_size;
+            }
+        }
+    }
+}
+
 /// Calls `callback` for each GcHeader pointer found.
 /// Objects are discovered by their `size` field (hop from one to the next).
 pub fn arena_walk_objects(mut callback: impl FnMut(*mut u8)) {

@@ -1362,13 +1362,21 @@ fn build_valid_pointer_set() -> ValidPointerSet {
     let arena_estimate = crate::arena::arena_total_bytes() / 48;
     let mut set = ValidPointerSet::new(malloc_count + arena_estimate + 64);
 
-    // Arena objects: walk arena blocks
-    crate::arena::arena_walk_objects(|header_ptr| {
+    // Arena objects: walk arena blocks in ascending data-pointer
+    // order so the inserted user_ptrs form one fully-sorted run
+    // (within each block, offsets only increase, so block-by-block
+    // ascending-address yields globally ascending user pointers).
+    // The final `sort()` then only has to in-place insertion-sort the
+    // small unsorted malloc tail and merge with the big sorted prefix
+    // — driftsort detects this as one long run + a tiny one and
+    // collapses to ~O(N) instead of O(N log K).
+    crate::arena::arena_walk_objects_addr_sorted(|header_ptr| {
         let user_ptr = unsafe { (header_ptr as *mut u8).add(GC_HEADER_SIZE) };
         set.insert(user_ptr as usize);
     });
 
-    // Malloc objects
+    // Malloc objects (insertion order, NOT sorted — driftsort handles
+    // the small unsorted tail in the finalize step below).
     MALLOC_STATE.with(|s| {
         let s = s.borrow();
         for &header in s.objects.iter() {
