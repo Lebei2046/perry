@@ -1968,6 +1968,10 @@ pub fn declare_stdlib_ffi(module: &mut LlModule) {
     // ========== Class registration ==========
     module.declare_function("js_register_class_getter", VOID, &[I64, I64, I64, I64]);
     module.declare_function("js_register_class_method", VOID, &[I64, I64, I64, I64, I64]);
+    // #446: bound-method closure for `obj.method` PropertyGet on a known class.
+    // Lets `typeof obj.method === "function"` and `let f = obj.method; f(args)`
+    // dispatch through CLASS_VTABLE_REGISTRY instead of returning undefined.
+    module.declare_function("js_class_method_bind", DOUBLE, &[DOUBLE, I64, I64]);
 
     // ========== Runtime init / module loader ==========
     module.declare_function("js_get_export", DOUBLE, &[I64, I64, I64]);

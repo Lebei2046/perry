@@ -4857,6 +4857,33 @@ pub extern "C" fn js_native_module_bind_method(
     crate::value::js_nanbox_pointer(closure as i64)
 }
 
+/// Build a "bound method" closure for `obj.method` PropertyGet on a known class
+/// instance. The captures (instance, method_name_ptr, method_name_len) drive
+/// `dispatch_bound_method` (closure.rs), which calls `js_native_call_method`
+/// — that resolves the method through `CLASS_VTABLE_REGISTRY` for any class
+/// registered by `js_register_class_method` at module init.
+///
+/// Issue #446: previously a class method reference (`let f = obj.method`,
+/// `typeof obj.method`, `arr.map(obj.method)`) silently lowered to the
+/// generic property-bag lookup, which doesn't store prototype methods —
+/// every such read returned `undefined`, so `typeof obj.method === "undefined"`
+/// and a captured method ran no body when invoked.
+///
+/// Method-name pointer is expected to be stable for the closure's lifetime;
+/// codegen emits it from the per-module `.str.N.bytes` rodata global.
+#[no_mangle]
+pub extern "C" fn js_class_method_bind(
+    instance: f64,
+    method_name_ptr: *const u8,
+    method_name_len: usize,
+) -> f64 {
+    let closure = crate::closure::js_closure_alloc(crate::closure::BOUND_METHOD_FUNC_PTR, 3);
+    crate::closure::js_closure_set_capture_f64(closure, 0, instance);
+    crate::closure::js_closure_set_capture_ptr(closure, 1, method_name_ptr as i64);
+    crate::closure::js_closure_set_capture_ptr(closure, 2, method_name_len as i64);
+    crate::value::js_nanbox_pointer(closure as i64)
+}
+
 /// Extract the module name string from a native module namespace object.
 unsafe fn get_module_name_from_namespace(namespace_obj: f64) -> &'static str {
     let jsval = JSValue::from_bits(namespace_obj.to_bits());

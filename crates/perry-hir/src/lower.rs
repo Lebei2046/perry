@@ -3492,11 +3492,6 @@ fn lower_module_decl(
 ) -> Result<()> {
     match decl {
         ast::ModuleDecl::Import(import_decl) => {
-            // Skip type-only imports (import type { ... } from '...') - they have no runtime value
-            if import_decl.type_only {
-                return Ok(());
-            }
-
             // Get the source module path
             let raw_source = import_decl.src.value.as_str().unwrap_or("").to_string();
             // Normalize "node:" prefix (e.g., "node:async_hooks" -> "async_hooks")
@@ -3507,6 +3502,26 @@ fn lower_module_decl(
 
             // Check if this is a native module import
             let is_native = is_native_module(&source);
+
+            // Native modules have no class metadata to extract — `node:fs`,
+            // `node:path`, etc. produce no `ImportedClass` entries and the
+            // runtime can't resolve type-only names anyway. Skip the whole
+            // declaration for native modules.
+            //
+            // For TypeScript modules, fall through and process the
+            // declaration even when `type_only` is set: the named-specifier
+            // loop below treats a whole-`import type { ... }` like a
+            // per-specifier `import { type ... }` (which already flowed
+            // class info into `imported_classes` since the v0.5.405 fix).
+            // Without this, `import type { Foo }` dropped Foo's class
+            // metadata before it reached compile.rs, so codegen lost the
+            // method registry — `obj.method()` worked only via the
+            // CLASS_VTABLE_REGISTRY runtime fallback (#392 followup) and
+            // `typeof obj.method` returned `"undefined"`. Issue #446.
+            if import_decl.type_only && is_native {
+                return Ok(());
+            }
+            let whole_decl_type_only = import_decl.type_only;
 
             // Parse import specifiers
             let mut specifiers = Vec::new();
@@ -3527,7 +3542,8 @@ fn lower_module_decl(
                         // because Query was never registered with codegen —
                         // the spread call on the closure invoked a stub that
                         // returned undefined. ECS demo-simple repro.
-                        if named.is_type_only && is_native {
+                        let spec_type_only = named.is_type_only || whole_decl_type_only;
+                        if spec_type_only && is_native {
                             continue;
                         }
                         let local = named.local.sym.to_string();
