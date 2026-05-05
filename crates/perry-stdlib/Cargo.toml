@@ -13,7 +13,7 @@ crate-type = ["rlib", "staticlib"]
 default = ["full"]
 
 # Full stdlib - everything included
-full = ["http-server", "http-client", "database", "crypto", "compression", "email", "websocket", "image", "scheduler", "ids", "html-parser", "rate-limit", "validation", "net", "tls", "bundled-dotenv", "bundled-slugify", "bundled-lru-cache"]
+full = ["http-server", "http-client", "database", "crypto", "compression", "email", "websocket", "image", "scheduler", "ids", "html-parser", "rate-limit", "validation", "net", "tls", "bundled-dotenv", "bundled-slugify", "bundled-lru-cache", "bundled-exponential-backoff"]
 
 # Minimal core - just what's needed for basic programs
 core = []
@@ -37,6 +37,9 @@ bundled-slugify = []
 # well-known table (#466 Phase 4). Pulls the `lru` crate dep so
 # both halves of the gate move in lockstep.
 bundled-lru-cache = ["dep:lru"]
+
+# Pure-Rust wrapper, no extra deps. Default-on through `full`.
+bundled-exponential-backoff = []
 
 # HTTP server (hyper-based native framework)
 # Note: dashmap is now always-on (used by core handle registry), no longer listed here.

@@ -86,3 +86,8 @@ tracking = "#466"
 crate = "perry-ext-zlib"
 lib = "perry_ext_zlib"
 tracking = "#466"
+
+[bindings.exponential-backoff]
+crate = "perry-ext-exponential-backoff"
+lib = "perry_ext_exponential_backoff"
+tracking = "#466"

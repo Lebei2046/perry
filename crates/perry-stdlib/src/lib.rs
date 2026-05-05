@@ -40,6 +40,9 @@ pub mod decimal;
 #[cfg(feature = "bundled-dotenv")]
 pub mod dotenv;
 pub mod events;
+// exponential_backoff feature-gated as of v0.5.542 so the
+// well-known flip can route to perry-ext-exponential-backoff.
+#[cfg(feature = "bundled-exponential-backoff")]
 pub mod exponential_backoff;
 pub mod lodash;
 // lru_cache is feature-gated as of v0.5.539 so the well-known
@@ -64,6 +67,7 @@ pub use decimal::*;
 #[cfg(feature = "bundled-dotenv")]
 pub use dotenv::*;
 pub use events::*;
+#[cfg(feature = "bundled-exponential-backoff")]
 pub use exponential_backoff::*;
 pub use lodash::*;
 #[cfg(feature = "bundled-lru-cache")]

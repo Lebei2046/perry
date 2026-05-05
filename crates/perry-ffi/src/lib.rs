@@ -60,6 +60,9 @@ pub use jsvalue::{
     ObjectHeader,
 };
 
+mod closure;
+pub use closure::{JsClosure, RawClosureHeader};
+
 use perry_runtime::js_string_from_bytes;
 pub use perry_runtime::StringHeader;
 

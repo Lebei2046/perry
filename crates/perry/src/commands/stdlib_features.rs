@@ -113,6 +113,10 @@ pub fn module_to_features(module: &str) -> &'static [&'static str] {
         // lru-cache: feature-gated v0.5.539; well-known flip
         // routes to perry-ext-lru-cache.
         "lru-cache" => &["bundled-lru-cache"],
+        // exponential-backoff: feature-gated v0.5.542 alongside
+        // the perry-ffi closure-invocation surface that powers
+        // its `backOff(fn)` retry loop.
+        "exponential-backoff" => &["bundled-exponential-backoff"],
         // dotenv was always-on through v0.5.532; gated behind
         // `bundled-dotenv` from v0.5.533 onwards so the well-known
         // bindings flip (#466 Phase 4 step 2) can swap perry-stdlib's

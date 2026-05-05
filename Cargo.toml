@@ -22,6 +22,7 @@ members = [
     "crates/perry-ext-lru-cache",
     "crates/perry-ext-better-sqlite3",
     "crates/perry-ext-zlib",
+    "crates/perry-ext-exponential-backoff",
     "crates/perry-jsruntime",
     "crates/perry-stdlib",
     "crates/perry-diagnostics",
@@ -71,6 +72,7 @@ default-members = [
     "crates/perry-ext-lru-cache",
     "crates/perry-ext-better-sqlite3",
     "crates/perry-ext-zlib",
+    "crates/perry-ext-exponential-backoff",
     "crates/perry-jsruntime",
     "crates/perry-stdlib",
     "crates/perry-diagnostics",
@@ -141,7 +143,7 @@ opt-level = "s"       # Optimize for size in stdlib
 opt-level = 3
 
 [workspace.package]
-version = "0.5.541"
+version = "0.5.542"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/PerryTS/perry"
@@ -218,6 +220,7 @@ perry-ext-validator = { path = "crates/perry-ext-validator" }
 perry-ext-lru-cache = { path = "crates/perry-ext-lru-cache" }
 perry-ext-better-sqlite3 = { path = "crates/perry-ext-better-sqlite3" }
 perry-ext-zlib = { path = "crates/perry-ext-zlib" }
+perry-ext-exponential-backoff = { path = "crates/perry-ext-exponential-backoff" }
 perry-stdlib = { path = "crates/perry-stdlib" }
 perry-diagnostics = { path = "crates/perry-diagnostics" }
 perry-jsruntime = { path = "crates/perry-jsruntime" }
