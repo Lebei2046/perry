@@ -101,3 +101,8 @@ tracking = "#424"
 crate = "perry-ext-iroh"
 lib = "perry_ext_iroh"
 tracking = "#425"
+
+[bindings.axios]
+crate = "perry-ext-axios"
+lib = "perry_ext_axios"
+tracking = "#466"
