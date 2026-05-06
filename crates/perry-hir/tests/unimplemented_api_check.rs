@@ -218,3 +218,59 @@ fn every_supported_module_rejects_bogus_member() {
         failures.join("\n  ")
     );
 }
+
+/// Coverage sweep for #525: same as `every_supported_module_rejects_bogus_member`
+/// but exercises the *call* form `m.bogus()` instead of the read form
+/// `m.bogus`. Pre-#525, perry/* namespace modules (and a few others) bailed
+/// in codegen's `lower_call/native.rs` with a per-module message (`'X' is
+/// not a known function`) — different wording, different escape hatch
+/// (consult `types/perry/<ns>/index.d.ts` instead of
+/// `perry --print-api-manifest`), buried under a multi-level wrapping
+/// chain. Now the canonical R005 message text fires uniformly across
+/// every supported module regardless of which path the AST takes to
+/// land at the rejection.
+#[test]
+fn every_supported_module_rejects_bogus_call() {
+    const SKIP: &[&str] = &[
+        // Side-effect-only — no value binding to access.
+        "dotenv/config",
+        // External (non-bundled) bindings — out-of-tree as of v0.5.557.
+        "tursodb",
+        "iroh",
+    ];
+
+    let mut failures: Vec<String> = Vec::new();
+    for &module in perry_api_manifest::NATIVE_MODULES {
+        if SKIP.contains(&module) {
+            continue;
+        }
+
+        let src = format!(
+            r#"
+            import * as m from "{module}";
+            m.__perry_known_bogus_member_525__();
+        "#
+        );
+        match lower_result(&src) {
+            Ok(_) => {
+                failures.push(format!(
+                    "{module}: bogus call did not error (strict mode not engaged)"
+                ));
+            }
+            Err(e) => {
+                if !(e.contains("not implemented") && e.contains("#463")) {
+                    failures.push(format!(
+                        "{module}: errored but not via the R005/#463 path — got {e}"
+                    ));
+                }
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "{} module(s) failed the #525 R005 call-form sweep:\n  {}",
+        failures.len(),
+        failures.join("\n  ")
+    );
+}

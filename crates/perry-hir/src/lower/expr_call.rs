@@ -908,6 +908,33 @@ pub(super) fn lower_call(ctx: &mut LoweringContext, call: &ast::CallExpr) -> Res
                             // This is a call on a native module (e.g., mysql.createConnection)
                             if let ast::MemberProp::Ident(method_ident) = &member.prop {
                                 let method_name = method_ident.sym.to_string();
+                                // Unimplemented-API gate (#463 / #525) for the 2-deep
+                                // `mod.method()` call form. Without this, perry/* and
+                                // other native-module call sites short-circuited past
+                                // the `lower_member` gate that fires for the property-
+                                // read form, then bailed in codegen with a per-module
+                                // message (`'X' is not a known function`) — different
+                                // wording, different escape hatch, harder for users to
+                                // recognize as the same class of mistake. Mirrors the
+                                // 3-deep gate above for `mod.X.Y()`.
+                                let allow_unimplemented =
+                                    std::env::var_os("PERRY_ALLOW_UNIMPLEMENTED").is_some();
+                                if !allow_unimplemented
+                                    && perry_api_manifest::module_has_any_entries(module_name)
+                                    && perry_api_manifest::module_has_symbol(
+                                        module_name,
+                                        &method_name,
+                                    )
+                                    .is_none()
+                                {
+                                    crate::lower_bail!(
+                                        member.span,
+                                        "`{}.{}` is not implemented in Perry — see `perry --print-api-manifest` for the supported surface, \
+                                         or set `PERRY_ALLOW_UNIMPLEMENTED=1` to ignore. (#463)",
+                                        module_name,
+                                        method_name,
+                                    );
+                                }
                                 return Ok(Expr::NativeMethodCall {
                                     module: module_name.to_string(),
                                     class_name: None, // Will be set by js_transform if needed
