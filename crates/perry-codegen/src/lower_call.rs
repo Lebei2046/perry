@@ -333,49 +333,30 @@ pub(crate) fn lower_call(ctx: &mut FnCtx<'_>, callee: &Expr, args: &[Expr]) -> R
                 lowered_args.push(lower_expr(ctx, a)?);
             }
 
-            // Check if this closure has rest params — if so, bundle
-            // trailing args into an array (same pattern as FuncRef).
-            let rest_idx = ctx
-                .local_closure_func_ids
-                .get(id)
-                .and_then(|cfid| ctx.closure_rest_params.get(cfid))
-                .copied();
-
-            let effective_args: Vec<String> = if let Some(ri) = rest_idx {
-                let fixed_count = ri;
-                let mut result: Vec<String> =
-                    lowered_args[..fixed_count.min(lowered_args.len())].to_vec();
-                // Materialize the rest array from trailing args.
-                let rest_slice = if fixed_count < lowered_args.len() {
-                    &lowered_args[fixed_count..]
-                } else {
-                    &[]
-                };
-                let rest_count = rest_slice.len() as u32;
-                let cap = rest_count.to_string();
-                let mut arr = ctx.block().call(I64, "js_array_alloc", &[(I32, &cap)]);
-                for v in rest_slice {
-                    let blk = ctx.block();
-                    arr = blk.call(I64, "js_array_push_f64", &[(I64, &arr), (DOUBLE, v)]);
-                }
-                let rest_box = nanbox_pointer_inline(ctx.block(), &arr);
-                result.push(rest_box);
-                result
-            } else {
-                lowered_args
-            };
-
-            if effective_args.len() > 16 {
+            // Issue #493: rest-bundling is now handled inside js_closure_callN
+            // via the runtime closure-rest registry — see
+            // `js_register_closure_rest` (registered for every closure body
+            // with `...rest` at module init) and `dispatch_rest_bundled` in
+            // `crates/perry-runtime/src/closure.rs`. Bundling at the static
+            // call site here would double-wrap (the runtime would re-bundle
+            // the already-bundled array into `[[a,b,c]]`), so the call site
+            // now passes the raw args through and lets the runtime
+            // pack the trailing tail into the rest slot.
+            //
+            // FuncRef calls (direct function-symbol dispatch) keep their
+            // static-bundling at lower_call.rs:444+ because they don't go
+            // through js_closure_callN.
+            if lowered_args.len() > 16 {
                 bail!(
                     "perry-codegen Phase D.1: closure call with {} args (max 16)",
-                    effective_args.len()
+                    lowered_args.len()
                 );
             }
             let blk = ctx.block();
             let closure_handle = unbox_to_i64(blk, &recv_box);
-            let runtime_fn = format!("js_closure_call{}", effective_args.len());
+            let runtime_fn = format!("js_closure_call{}", lowered_args.len());
             let mut call_args: Vec<(crate::types::LlvmType, &str)> = vec![(I64, &closure_handle)];
-            for v in &effective_args {
+            for v in &lowered_args {
                 call_args.push((DOUBLE, v.as_str()));
             }
             return Ok(blk.call(DOUBLE, &runtime_fn, &call_args));

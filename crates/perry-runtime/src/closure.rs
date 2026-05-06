@@ -35,6 +35,155 @@ thread_local! {
 /// Used by js_value_typeof to return "function" instead of "object" for closures.
 pub const CLOSURE_MAGIC: u32 = 0x434C_4F53; // "CLOS" in ASCII
 
+// Side-table mapping closure body `func_ptr` -> fixed_arity (number of fixed
+// params declared BEFORE the rest param). Populated at module init by
+// `js_register_closure_rest` for every closure body whose HIR signature ends
+// in `...rest`. Looked up by `js_closure_callN` so that calls through dynamic
+// dispatch (e.g. `obj.cb(a, b, c)` where `cb` is a class field holding an
+// arrow) bundle trailing args into the rest array — the previous behavior
+// passed unbundled args, leaving the rest param bound to the first trailing
+// arg as a scalar (issue #493 / #421-rest fix). Static call sites (named
+// functions, `Expr::FuncRef`, local closure-bound `let`) keep their existing
+// bundling at the call site, which is faster — the registry is consulted only
+// when needed.
+//
+// Stored as a thread-local rather than a global RwLock because closures are
+// thread-local in perry's runtime model (each thread has its own arena +
+// GC), so a per-thread copy avoids the per-call lock acquisition. Module
+// init runs on the main thread and populates one entry per
+// rest-param-bearing closure body in the program; worker threads (issue
+// #29 `perry/thread`) currently don't see the table because they aren't
+// supposed to invoke arbitrary user closures across the boundary anyway.
+thread_local! {
+    static CLOSURE_REST_REGISTRY: RefCell<HashMap<usize, u32>> = RefCell::new(HashMap::new());
+}
+
+/// Register that the closure body at `func_ptr` has a rest parameter at index
+/// `fixed_arity` (i.e., the closure has `fixed_arity` fixed params before the
+/// rest param, and its declared LLVM arity is `fixed_arity + 1` — the +1 is
+/// the rest array). Called once per closure literal at module init time.
+#[no_mangle]
+pub extern "C" fn js_register_closure_rest(func_ptr: *const u8, fixed_arity: u32) {
+    if func_ptr.is_null() {
+        return;
+    }
+    CLOSURE_REST_REGISTRY.with(|r| {
+        r.borrow_mut().insert(func_ptr as usize, fixed_arity);
+    });
+}
+
+#[inline(always)]
+fn lookup_closure_rest(func_ptr: *const u8) -> Option<u32> {
+    CLOSURE_REST_REGISTRY.with(|r| r.borrow().get(&(func_ptr as usize)).copied())
+}
+
+/// Build a JS array from a slice of NaN-boxed f64 values and return it
+/// NaN-boxed as a pointer. Used by the rest-bundling helper below.
+#[inline(always)]
+unsafe fn build_rest_array(values: &[f64]) -> f64 {
+    let arr = crate::array::js_array_alloc(values.len() as u32);
+    let mut cur = arr;
+    for v in values {
+        cur = crate::array::js_array_push_f64(cur, *v);
+    }
+    f64::from_bits(crate::value::JSValue::pointer(cur as *mut u8).bits())
+}
+
+/// Dispatch a closure with `args` to its body using a rest-bundled call.
+/// `func_ptr` is already validated and known non-BOUND. `fixed_arity` is the
+/// closure body's declared arity minus 1 (the +1 being the rest array).
+///
+/// Behavior matches the static-call-site bundling path in `lower_call.rs`:
+/// the first `fixed_arity` args are forwarded as-is (padded with `undefined`
+/// when the caller passed fewer than expected); everything from index
+/// `fixed_arity` onwards is bundled into a fresh JS Array passed as the
+/// last arg. The body is then invoked with exactly `fixed_arity + 1` doubles.
+///
+/// Currently supports `fixed_arity` in `0..=15` — the same ceiling as
+/// `js_closure_callN`. A program that defines a rest closure with more than
+/// 15 fixed params before the rest is unsupported (and would already trip
+/// the `Phase D.1: closure call with N args (max 16)` guard in lower_call).
+#[inline(never)]
+unsafe fn dispatch_rest_bundled(
+    closure: *const ClosureHeader,
+    func_ptr: *const u8,
+    args: &[f64],
+    fixed_arity: u32,
+) -> f64 {
+    let undef = f64::from_bits(crate::value::TAG_UNDEFINED);
+    let k = fixed_arity as usize;
+    let provided = args.len();
+
+    // Bundle trailing args from index `k` onwards.
+    let rest_slice: &[f64] = if provided > k { &args[k..] } else { &[] };
+    let rest_double = build_rest_array(rest_slice);
+
+    // Read fixed args, padding with undefined when caller under-supplied.
+    macro_rules! a {
+        ($i:expr) => {
+            if $i < provided { args[$i] } else { undef }
+        };
+    }
+
+    match k {
+        0 => {
+            let f: extern "C" fn(*const ClosureHeader, f64) -> f64 =
+                std::mem::transmute(func_ptr);
+            f(closure, rest_double)
+        }
+        1 => {
+            let f: extern "C" fn(*const ClosureHeader, f64, f64) -> f64 =
+                std::mem::transmute(func_ptr);
+            f(closure, a!(0), rest_double)
+        }
+        2 => {
+            let f: extern "C" fn(*const ClosureHeader, f64, f64, f64) -> f64 =
+                std::mem::transmute(func_ptr);
+            f(closure, a!(0), a!(1), rest_double)
+        }
+        3 => {
+            let f: extern "C" fn(*const ClosureHeader, f64, f64, f64, f64) -> f64 =
+                std::mem::transmute(func_ptr);
+            f(closure, a!(0), a!(1), a!(2), rest_double)
+        }
+        4 => {
+            let f: extern "C" fn(*const ClosureHeader, f64, f64, f64, f64, f64) -> f64 =
+                std::mem::transmute(func_ptr);
+            f(closure, a!(0), a!(1), a!(2), a!(3), rest_double)
+        }
+        5 => {
+            let f: extern "C" fn(*const ClosureHeader, f64, f64, f64, f64, f64, f64) -> f64 =
+                std::mem::transmute(func_ptr);
+            f(closure, a!(0), a!(1), a!(2), a!(3), a!(4), rest_double)
+        }
+        6 => {
+            let f: extern "C" fn(*const ClosureHeader, f64, f64, f64, f64, f64, f64, f64) -> f64 =
+                std::mem::transmute(func_ptr);
+            f(closure, a!(0), a!(1), a!(2), a!(3), a!(4), a!(5), rest_double)
+        }
+        7 => {
+            let f: extern "C" fn(
+                *const ClosureHeader,
+                f64,
+                f64,
+                f64,
+                f64,
+                f64,
+                f64,
+                f64,
+                f64,
+            ) -> f64 = std::mem::transmute(func_ptr);
+            f(closure, a!(0), a!(1), a!(2), a!(3), a!(4), a!(5), a!(6), rest_double)
+        }
+        _ => {
+            // Unsupported arity — fall back to undefined so we don't
+            // mis-call the body and trigger UB. This mirrors the upper
+            // bound that lower_call's static-bundling path enforces.
+            f64::from_bits(crate::value::TAG_UNDEFINED)
+        }
+    }
+}
+
 /// Sentinel func_ptr value indicating this closure is a "bound method" on a native module.
 /// When js_closure_callN detects this, it extracts captures and dispatches via js_native_call_method.
 /// Captures layout: [0] = namespace_obj (f64), [1] = method_name_ptr (i64), [2] = method_name_len (i64)
@@ -323,6 +472,9 @@ pub extern "C" fn js_closure_call0(closure: *const ClosureHeader) -> f64 {
     if func_ptr == BOUND_METHOD_FUNC_PTR {
         return unsafe { dispatch_bound_method(closure, &[]) };
     }
+    if let Some(fixed_arity) = lookup_closure_rest(func_ptr) {
+        return unsafe { dispatch_rest_bundled(closure, func_ptr, &[], fixed_arity) };
+    }
     let func: extern "C" fn(*const ClosureHeader) -> f64 = unsafe { std::mem::transmute(func_ptr) };
     func(closure)
 }
@@ -336,6 +488,9 @@ pub extern "C" fn js_closure_call1(closure: *const ClosureHeader, arg0: f64) -> 
     }
     if func_ptr == BOUND_METHOD_FUNC_PTR {
         return unsafe { dispatch_bound_method(closure, &[arg0]) };
+    }
+    if let Some(fixed_arity) = lookup_closure_rest(func_ptr) {
+        return unsafe { dispatch_rest_bundled(closure, func_ptr, &[arg0], fixed_arity) };
     }
     let func: extern "C" fn(*const ClosureHeader, f64) -> f64 =
         unsafe { std::mem::transmute(func_ptr) };
@@ -351,6 +506,9 @@ pub extern "C" fn js_closure_call2(closure: *const ClosureHeader, arg0: f64, arg
     }
     if func_ptr == BOUND_METHOD_FUNC_PTR {
         return unsafe { dispatch_bound_method(closure, &[arg0, arg1]) };
+    }
+    if let Some(fixed_arity) = lookup_closure_rest(func_ptr) {
+        return unsafe { dispatch_rest_bundled(closure, func_ptr, &[arg0, arg1], fixed_arity) };
     }
     let func: extern "C" fn(*const ClosureHeader, f64, f64) -> f64 =
         unsafe { std::mem::transmute(func_ptr) };
@@ -372,6 +530,11 @@ pub extern "C" fn js_closure_call3(
     if func_ptr == BOUND_METHOD_FUNC_PTR {
         return unsafe { dispatch_bound_method(closure, &[arg0, arg1, arg2]) };
     }
+    if let Some(fixed_arity) = lookup_closure_rest(func_ptr) {
+        return unsafe {
+            dispatch_rest_bundled(closure, func_ptr, &[arg0, arg1, arg2], fixed_arity)
+        };
+    }
     let func: extern "C" fn(*const ClosureHeader, f64, f64, f64) -> f64 =
         unsafe { std::mem::transmute(func_ptr) };
     func(closure, arg0, arg1, arg2)
@@ -392,6 +555,11 @@ pub extern "C" fn js_closure_call4(
     }
     if func_ptr == BOUND_METHOD_FUNC_PTR {
         return unsafe { dispatch_bound_method(closure, &[arg0, arg1, arg2, arg3]) };
+    }
+    if let Some(fixed_arity) = lookup_closure_rest(func_ptr) {
+        return unsafe {
+            dispatch_rest_bundled(closure, func_ptr, &[arg0, arg1, arg2, arg3], fixed_arity)
+        };
     }
     let func: extern "C" fn(*const ClosureHeader, f64, f64, f64, f64) -> f64 =
         unsafe { std::mem::transmute(func_ptr) };
@@ -415,6 +583,16 @@ pub extern "C" fn js_closure_call5(
     if func_ptr == BOUND_METHOD_FUNC_PTR {
         return unsafe { dispatch_bound_method(closure, &[arg0, arg1, arg2, arg3, arg4]) };
     }
+    if let Some(fixed_arity) = lookup_closure_rest(func_ptr) {
+        return unsafe {
+            dispatch_rest_bundled(
+                closure,
+                func_ptr,
+                &[arg0, arg1, arg2, arg3, arg4],
+                fixed_arity,
+            )
+        };
+    }
     let func: extern "C" fn(*const ClosureHeader, f64, f64, f64, f64, f64) -> f64 =
         unsafe { std::mem::transmute(func_ptr) };
     func(closure, arg0, arg1, arg2, arg3, arg4)
@@ -437,6 +615,16 @@ pub extern "C" fn js_closure_call6(
     }
     if func_ptr == BOUND_METHOD_FUNC_PTR {
         return unsafe { dispatch_bound_method(closure, &[arg0, arg1, arg2, arg3, arg4, arg5]) };
+    }
+    if let Some(fixed_arity) = lookup_closure_rest(func_ptr) {
+        return unsafe {
+            dispatch_rest_bundled(
+                closure,
+                func_ptr,
+                &[arg0, arg1, arg2, arg3, arg4, arg5],
+                fixed_arity,
+            )
+        };
     }
     let func: extern "C" fn(*const ClosureHeader, f64, f64, f64, f64, f64, f64) -> f64 =
         unsafe { std::mem::transmute(func_ptr) };

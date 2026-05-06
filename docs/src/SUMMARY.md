@@ -42,6 +42,7 @@
 - [Events](ui/events.md)
 - [Canvas](ui/canvas.md)
 - [Menus](ui/menus.md)
+- [Tray Icon](ui/tray.md)
 - [Dialogs](ui/dialogs.md)
 - [Table](ui/table.md)
 - [Animation](ui/animation.md)

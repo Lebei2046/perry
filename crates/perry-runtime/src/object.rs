@@ -3888,6 +3888,24 @@ pub unsafe extern "C" fn js_native_call_method(
                         let result = crate::array::js_array_filter(arr, cb_ptr);
                         return f64::from_bits(JSValue::pointer(result as *mut u8).bits());
                     }
+                    // Issue #493 followup: dispatch `forEach` on any-typed
+                    // arrays the same way as map/filter. Codegen's HIR-level
+                    // `Expr::ArrayForEach` only fires for receivers it can
+                    // statically prove are arrays — rest params and other
+                    // dynamically-typed receivers fall through to the runtime
+                    // dispatch tower, where this arm now intercepts. Without
+                    // it, `args.forEach(cb)` (where `args` is a closure rest
+                    // param threaded across module boundaries) silently
+                    // no-op'd, breaking hono's route-registration loop and
+                    // any other code that does the same arrow-rest-forEach
+                    // pattern.
+                    "forEach" if args_len >= 1 && !args_ptr.is_null() => {
+                        let arr = raw_ptr as *const crate::array::ArrayHeader;
+                        let cb_bits = (*args_ptr).to_bits() & 0x0000_FFFF_FFFF_FFFF;
+                        let cb_ptr = cb_bits as *const crate::closure::ClosureHeader;
+                        crate::array::js_array_forEach(arr, cb_ptr);
+                        return f64::from_bits(crate::value::TAG_UNDEFINED);
+                    }
                     // Issue #291: defensive `slice` arm for arrays that
                     // reach the generic dispatch tower (e.g. when the
                     // receiver is `Expr::Logical` / `Expr::Conditional` /

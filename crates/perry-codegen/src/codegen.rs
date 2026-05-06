@@ -2240,6 +2240,7 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         &class_keys_init_data,
         &class_ids,
         &class_table,
+        &closure_rest_params,
     );
 
     // Emit the buffer alias-scope metadata once per module, covering every
@@ -3764,6 +3765,7 @@ fn emit_string_pool(
     class_keys_init_data: &[(String, String, u32)],
     class_ids: &HashMap<String, u32>,
     classes: &HashMap<String, &perry_hir::Class>,
+    closure_rest_params: &HashMap<u32, usize>,
 ) {
     for entry in strings.iter() {
         // .rodata bytes — `[N+1 x i8]` because we include the null terminator.
@@ -3961,6 +3963,30 @@ fn emit_string_pool(
                 (I64, &func_i64),
                 (I64, &param_count.to_string()),
             ],
+        );
+    }
+
+    // Issue #493: register each rest-bearing closure body's func_ptr ->
+    // fixed_arity in the runtime's closure-rest side table. `js_closure_callN`
+    // consults it to bundle trailing args at call sites where codegen
+    // doesn't know the closure's arity statically (e.g. `obj.cb(a, b, c)`
+    // where `cb` is a class field holding `(...args) => …`). Without this
+    // entry the closure body sees the first arg as the rest param itself,
+    // not the bundled array — `args.length` reads `1` against the string
+    // value, and trailing args are dropped. Static call sites (named fns,
+    // `Expr::FuncRef`, `let f = (...args)=>…; f(a,b,c)`) keep their
+    // existing call-site bundling and never enter this dispatch path.
+    let mut sorted_rest: Vec<(u32, usize)> = closure_rest_params
+        .iter()
+        .map(|(fid, ri)| (*fid, *ri))
+        .collect();
+    sorted_rest.sort_unstable();
+    for (fid, fixed_arity) in sorted_rest {
+        let closure_sym = format!("perry_closure_{}__{}", module_prefix, fid);
+        let func_ref = format!("@{}", closure_sym);
+        blk.call_void(
+            "js_register_closure_rest",
+            &[(PTR, &func_ref), (I32, &fixed_arity.to_string())],
         );
     }
 

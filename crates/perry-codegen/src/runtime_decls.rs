@@ -203,6 +203,12 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     );
     module.declare_function("js_closure_set_capture_f64", VOID, &[I64, I32, DOUBLE]);
     module.declare_function("js_closure_get_capture_f64", DOUBLE, &[I64, I32]);
+    // Issue #493: register a closure body's rest-param arity in the runtime
+    // side-table so `js_closure_callN` can bundle trailing args at call
+    // sites where codegen doesn't know the closure's arity statically
+    // (e.g. `obj.cb(a, b, c)` where `cb` is a class field holding an
+    // arrow with `...rest`). Called once per closure body at module init.
+    module.declare_function("js_register_closure_rest", VOID, &[PTR, I32]);
     module.declare_function("js_closure_call0", DOUBLE, &[I64]);
     module.declare_function("js_closure_call1", DOUBLE, &[I64, DOUBLE]);
     module.declare_function("js_closure_call2", DOUBLE, &[I64, DOUBLE, DOUBLE]);
