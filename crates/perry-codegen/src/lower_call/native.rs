@@ -581,6 +581,35 @@ pub(crate) fn lower_native_method_call(
         return Ok(result);
     }
 
+    // Issue #535 Layer 2 — `__navstack_register_route(synth_id, name, body)`
+    // synthetic method emitted by state_desugar's NavStack(state, routes)
+    // rewrite. Lowers `body` to a widget handle (NaN-boxed pointer →
+    // unbox to i64) and forwards (synth_id, name, handle) to the runtime
+    // registry. The runtime walks this map on every js_state_set for the
+    // matching synth id, toggling each route's NSView.isHidden via the
+    // platform handler registered by perry-ui-macos at app startup.
+    if module == "perry/ui" && method == "__navstack_register_route" && object.is_none() {
+        if args.len() != 3 {
+            return Ok(double_literal(f64::from_bits(0x7FFC_0000_0000_0001)));
+        }
+        let synth_id_d = lower_expr(ctx, &args[0])?;
+        let name_d = lower_expr(ctx, &args[1])?;
+        let body_d = lower_expr(ctx, &args[2])?;
+        let body_i64 = unbox_to_i64(ctx.block(), &body_d);
+        ctx.pending_declares.push((
+            "js_navstack_register_route".to_string(),
+            crate::types::VOID,
+            vec![DOUBLE, DOUBLE, I64],
+        ));
+        ctx.block().call_void(
+            "js_navstack_register_route",
+            &[(DOUBLE, &synth_id_d), (DOUBLE, &name_d), (I64, &body_i64)],
+        );
+        // Return the body handle (already NaN-boxed) so the rewrite can
+        // chain by binding the result as the route's host child.
+        return Ok(body_d);
+    }
+
     // perry/arkts: HarmonyOS Phase 2 v2 callback bridge. Synthetic module
     // injected by the harvest pass (`compile.rs::emit_index_ets`) — never
     // user-authored. `registerCallback(idx, closure)` lowers to a call to

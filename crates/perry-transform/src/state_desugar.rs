@@ -56,9 +56,31 @@
 //! `perry-codegen-arkts`'s harvest stays the source of truth there.
 
 use perry_hir::walker::walk_expr_children_mut;
-use perry_hir::{Expr, Module, Stmt};
-use perry_types::LocalId;
+use perry_hir::{Expr, Module, Param, Stmt};
+use perry_types::{FuncId, LocalId, Type};
 use std::collections::HashMap;
+
+/// Counters threaded through the rewrite for fresh `LocalId` / `FuncId`
+/// allocation. The NavStack lowering needs both: each call site spawns a
+/// closure (one fresh `FuncId`) holding `1 + N` fresh local bindings (host
+/// + one per route).
+struct FreshIds {
+    next_local: LocalId,
+    next_func: FuncId,
+}
+
+impl FreshIds {
+    fn fresh_local(&mut self) -> LocalId {
+        let id = self.next_local;
+        self.next_local += 1;
+        id
+    }
+    fn fresh_func(&mut self) -> FuncId {
+        let id = self.next_func;
+        self.next_func += 1;
+        id
+    }
+}
 
 /// One `state<T>` declaration the pass has decided to rewrite.
 struct StateBinding {
@@ -79,10 +101,278 @@ pub fn run(module: &mut Module) {
         return;
     }
     rewrite_init_decls(&mut module.init, &bindings);
-    rewrite_stmts(&mut module.init, &bindings);
+    let mut fresh = FreshIds {
+        next_local: compute_max_local_id(module).saturating_add(1),
+        next_func: compute_max_func_id(module).saturating_add(1),
+    };
+    rewrite_stmts(&mut module.init, &bindings, &mut fresh);
     for func in module.functions.iter_mut() {
-        rewrite_stmts(&mut func.body, &bindings);
+        rewrite_stmts(&mut func.body, &bindings, &mut fresh);
     }
+}
+
+/// Walk the entire module to find the highest `LocalId` already in use.
+/// Mirrors `async_to_generator::compute_max_local_id` shape (param scan
+/// + stmt scan + class member scan) so allocations don't collide with
+/// `ctx.fresh_local()` ids inside class methods or with later transforms
+/// that allocate from the same global namespace.
+fn compute_max_local_id(module: &Module) -> LocalId {
+    let mut max_id: LocalId = 0;
+    let mut walk_stmts = |stmts: &[Stmt], max_id: &mut LocalId| {
+        for stmt in stmts {
+            scan_stmt_local_ids(stmt, max_id);
+        }
+    };
+    for func in &module.functions {
+        for p in &func.params {
+            max_id = max_id.max(p.id);
+        }
+        walk_stmts(&func.body, &mut max_id);
+    }
+    walk_stmts(&module.init, &mut max_id);
+    for global in &module.globals {
+        max_id = max_id.max(global.id);
+    }
+    for class in &module.classes {
+        for method in &class.methods {
+            for p in &method.params {
+                max_id = max_id.max(p.id);
+            }
+            walk_stmts(&method.body, &mut max_id);
+        }
+        if let Some(ctor) = &class.constructor {
+            for p in &ctor.params {
+                max_id = max_id.max(p.id);
+            }
+            walk_stmts(&ctor.body, &mut max_id);
+        }
+    }
+    max_id
+}
+
+fn compute_max_func_id(module: &Module) -> FuncId {
+    let mut max_id: FuncId = 0;
+    for func in &module.functions {
+        max_id = max_id.max(func.id);
+    }
+    let mut walk_stmts = |stmts: &[Stmt], max_id: &mut FuncId| {
+        for stmt in stmts {
+            scan_stmt_func_ids(stmt, max_id);
+        }
+    };
+    walk_stmts(&module.init, &mut max_id);
+    for func in &module.functions {
+        walk_stmts(&func.body, &mut max_id);
+    }
+    for class in &module.classes {
+        for method in &class.methods {
+            max_id = max_id.max(method.id);
+            walk_stmts(&method.body, &mut max_id);
+        }
+        if let Some(ctor) = &class.constructor {
+            max_id = max_id.max(ctor.id);
+            walk_stmts(&ctor.body, &mut max_id);
+        }
+    }
+    max_id
+}
+
+fn scan_stmt_local_ids(stmt: &Stmt, max_id: &mut LocalId) {
+    match stmt {
+        Stmt::Let { id, init, .. } => {
+            *max_id = (*max_id).max(*id);
+            if let Some(e) = init {
+                scan_expr_local_ids(e, max_id);
+            }
+        }
+        Stmt::Expr(e) | Stmt::Throw(e) => scan_expr_local_ids(e, max_id),
+        Stmt::Return(Some(e)) => scan_expr_local_ids(e, max_id),
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            scan_expr_local_ids(condition, max_id);
+            for s in then_branch {
+                scan_stmt_local_ids(s, max_id);
+            }
+            if let Some(eb) = else_branch {
+                for s in eb {
+                    scan_stmt_local_ids(s, max_id);
+                }
+            }
+        }
+        Stmt::While { condition, body } | Stmt::DoWhile { body, condition } => {
+            scan_expr_local_ids(condition, max_id);
+            for s in body {
+                scan_stmt_local_ids(s, max_id);
+            }
+        }
+        Stmt::For {
+            init,
+            condition,
+            update,
+            body,
+        } => {
+            if let Some(i) = init {
+                scan_stmt_local_ids(i, max_id);
+            }
+            if let Some(c) = condition {
+                scan_expr_local_ids(c, max_id);
+            }
+            if let Some(u) = update {
+                scan_expr_local_ids(u, max_id);
+            }
+            for s in body {
+                scan_stmt_local_ids(s, max_id);
+            }
+        }
+        Stmt::Try {
+            body, catch, finally, ..
+        } => {
+            for s in body {
+                scan_stmt_local_ids(s, max_id);
+            }
+            if let Some(c) = catch {
+                if let Some((id, _)) = c.param {
+                    *max_id = (*max_id).max(id);
+                }
+                for s in &c.body {
+                    scan_stmt_local_ids(s, max_id);
+                }
+            }
+            if let Some(f) = finally {
+                for s in f {
+                    scan_stmt_local_ids(s, max_id);
+                }
+            }
+        }
+        Stmt::Switch { discriminant, cases } => {
+            scan_expr_local_ids(discriminant, max_id);
+            for case in cases {
+                if let Some(t) = &case.test {
+                    scan_expr_local_ids(t, max_id);
+                }
+                for s in &case.body {
+                    scan_stmt_local_ids(s, max_id);
+                }
+            }
+        }
+        Stmt::Labeled { body, .. } => scan_stmt_local_ids(body, max_id),
+        _ => {}
+    }
+}
+
+fn scan_expr_local_ids(e: &Expr, max_id: &mut LocalId) {
+    match e {
+        Expr::LocalGet(id) | Expr::LocalSet(id, _) => {
+            *max_id = (*max_id).max(*id);
+        }
+        _ => {}
+    }
+    use perry_hir::walker::walk_expr_children;
+    walk_expr_children(e, &mut |child| scan_expr_local_ids(child, max_id));
+    if let Expr::Closure { params, body, .. } = e {
+        for p in params {
+            *max_id = (*max_id).max(p.id);
+        }
+        for s in body {
+            scan_stmt_local_ids(s, max_id);
+        }
+    }
+}
+
+fn scan_stmt_func_ids(stmt: &Stmt, max_id: &mut FuncId) {
+    match stmt {
+        Stmt::Let { init: Some(e), .. } => scan_expr_func_ids(e, max_id),
+        Stmt::Expr(e) | Stmt::Throw(e) => scan_expr_func_ids(e, max_id),
+        Stmt::Return(Some(e)) => scan_expr_func_ids(e, max_id),
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            scan_expr_func_ids(condition, max_id);
+            for s in then_branch {
+                scan_stmt_func_ids(s, max_id);
+            }
+            if let Some(eb) = else_branch {
+                for s in eb {
+                    scan_stmt_func_ids(s, max_id);
+                }
+            }
+        }
+        Stmt::While { condition, body } | Stmt::DoWhile { body, condition } => {
+            scan_expr_func_ids(condition, max_id);
+            for s in body {
+                scan_stmt_func_ids(s, max_id);
+            }
+        }
+        Stmt::For {
+            init,
+            condition,
+            update,
+            body,
+        } => {
+            if let Some(i) = init {
+                scan_stmt_func_ids(i, max_id);
+            }
+            if let Some(c) = condition {
+                scan_expr_func_ids(c, max_id);
+            }
+            if let Some(u) = update {
+                scan_expr_func_ids(u, max_id);
+            }
+            for s in body {
+                scan_stmt_func_ids(s, max_id);
+            }
+        }
+        Stmt::Try {
+            body, catch, finally, ..
+        } => {
+            for s in body {
+                scan_stmt_func_ids(s, max_id);
+            }
+            if let Some(c) = catch {
+                for s in &c.body {
+                    scan_stmt_func_ids(s, max_id);
+                }
+            }
+            if let Some(f) = finally {
+                for s in f {
+                    scan_stmt_func_ids(s, max_id);
+                }
+            }
+        }
+        Stmt::Switch { discriminant, cases } => {
+            scan_expr_func_ids(discriminant, max_id);
+            for case in cases {
+                if let Some(t) = &case.test {
+                    scan_expr_func_ids(t, max_id);
+                }
+                for s in &case.body {
+                    scan_stmt_func_ids(s, max_id);
+                }
+            }
+        }
+        Stmt::Labeled { body, .. } => scan_stmt_func_ids(body, max_id),
+        _ => {}
+    }
+}
+
+fn scan_expr_func_ids(e: &Expr, max_id: &mut FuncId) {
+    match e {
+        Expr::FuncRef(id) => *max_id = (*max_id).max(*id),
+        Expr::Closure { func_id, body, .. } => {
+            *max_id = (*max_id).max(*func_id);
+            for s in body {
+                scan_stmt_func_ids(s, max_id);
+            }
+        }
+        _ => {}
+    }
+    use perry_hir::walker::walk_expr_children;
+    walk_expr_children(e, &mut |child| scan_expr_func_ids(child, max_id));
 }
 
 /// Walk `module.init` for `let x = state(initial)` and assign each a
@@ -161,32 +451,40 @@ fn rewrite_init_decls(init: &mut Vec<Stmt>, bindings: &HashMap<LocalId, StateBin
 /// Recursively rewrite every `Stmt` in `stmts`. Descends into block-shaped
 /// children (if/while/for/etc.) so closures buried in `Button(label, () =>
 /// state.set(...))` are visited.
-fn rewrite_stmts(stmts: &mut Vec<Stmt>, bindings: &HashMap<LocalId, StateBinding>) {
+fn rewrite_stmts(
+    stmts: &mut Vec<Stmt>,
+    bindings: &HashMap<LocalId, StateBinding>,
+    fresh: &mut FreshIds,
+) {
     for stmt in stmts.iter_mut() {
-        rewrite_stmt(stmt, bindings);
+        rewrite_stmt(stmt, bindings, fresh);
     }
 }
 
-fn rewrite_stmt(stmt: &mut Stmt, bindings: &HashMap<LocalId, StateBinding>) {
+fn rewrite_stmt(
+    stmt: &mut Stmt,
+    bindings: &HashMap<LocalId, StateBinding>,
+    fresh: &mut FreshIds,
+) {
     match stmt {
-        Stmt::Expr(e) => rewrite_expr(e, bindings),
-        Stmt::Return(Some(e)) => rewrite_expr(e, bindings),
-        Stmt::Throw(e) => rewrite_expr(e, bindings),
-        Stmt::Let { init: Some(e), .. } => rewrite_expr(e, bindings),
+        Stmt::Expr(e) => rewrite_expr(e, bindings, fresh),
+        Stmt::Return(Some(e)) => rewrite_expr(e, bindings, fresh),
+        Stmt::Throw(e) => rewrite_expr(e, bindings, fresh),
+        Stmt::Let { init: Some(e), .. } => rewrite_expr(e, bindings, fresh),
         Stmt::If {
             condition,
             then_branch,
             else_branch,
         } => {
-            rewrite_expr(condition, bindings);
-            rewrite_stmts(then_branch, bindings);
+            rewrite_expr(condition, bindings, fresh);
+            rewrite_stmts(then_branch, bindings, fresh);
             if let Some(eb) = else_branch {
-                rewrite_stmts(eb, bindings);
+                rewrite_stmts(eb, bindings, fresh);
             }
         }
         Stmt::While { condition, body } | Stmt::DoWhile { body, condition } => {
-            rewrite_expr(condition, bindings);
-            rewrite_stmts(body, bindings);
+            rewrite_expr(condition, bindings, fresh);
+            rewrite_stmts(body, bindings, fresh);
         }
         Stmt::For {
             init,
@@ -195,39 +493,39 @@ fn rewrite_stmt(stmt: &mut Stmt, bindings: &HashMap<LocalId, StateBinding>) {
             body,
         } => {
             if let Some(i) = init {
-                rewrite_stmt(i.as_mut(), bindings);
+                rewrite_stmt(i.as_mut(), bindings, fresh);
             }
             if let Some(c) = condition {
-                rewrite_expr(c, bindings);
+                rewrite_expr(c, bindings, fresh);
             }
             if let Some(u) = update {
-                rewrite_expr(u, bindings);
+                rewrite_expr(u, bindings, fresh);
             }
-            rewrite_stmts(body, bindings);
+            rewrite_stmts(body, bindings, fresh);
         }
         Stmt::Try {
             body,
             catch,
             finally,
         } => {
-            rewrite_stmts(body, bindings);
+            rewrite_stmts(body, bindings, fresh);
             if let Some(c) = catch {
-                rewrite_stmts(&mut c.body, bindings);
+                rewrite_stmts(&mut c.body, bindings, fresh);
             }
             if let Some(f) = finally {
-                rewrite_stmts(f, bindings);
+                rewrite_stmts(f, bindings, fresh);
             }
         }
         Stmt::Switch { discriminant, cases } => {
-            rewrite_expr(discriminant, bindings);
+            rewrite_expr(discriminant, bindings, fresh);
             for case in cases {
                 if let Some(t) = &mut case.test {
-                    rewrite_expr(t, bindings);
+                    rewrite_expr(t, bindings, fresh);
                 }
-                rewrite_stmts(&mut case.body, bindings);
+                rewrite_stmts(&mut case.body, bindings, fresh);
             }
         }
-        Stmt::Labeled { body, .. } => rewrite_stmt(body.as_mut(), bindings),
+        Stmt::Labeled { body, .. } => rewrite_stmt(body.as_mut(), bindings, fresh),
         _ => {}
     }
 }
@@ -243,16 +541,170 @@ fn rewrite_stmt(stmt: &mut Stmt, bindings: &HashMap<LocalId, StateBinding>) {
 /// the inner-first walk, the outer `.set` rewrite would clone the arg
 /// expression containing the un-rewritten inner `.get()`, leaving it
 /// as a plain `LocalGet(state).get()` on a holder that's now `undefined`.
-fn rewrite_expr(e: &mut Expr, bindings: &HashMap<LocalId, StateBinding>) {
-    walk_expr_children_mut(e, &mut |child| rewrite_expr(child, bindings));
+fn rewrite_expr(
+    e: &mut Expr,
+    bindings: &HashMap<LocalId, StateBinding>,
+    fresh: &mut FreshIds,
+) {
+    walk_expr_children_mut(e, &mut |child| rewrite_expr(child, bindings, fresh));
 
     if let Expr::Closure { body, .. } = e {
-        rewrite_stmts(body, bindings);
+        rewrite_stmts(body, bindings, fresh);
+    }
+
+    if let Some(replacement) = try_rewrite_navstack(e, bindings, fresh) {
+        *e = replacement;
+        return;
     }
 
     if let Some(replacement) = try_rewrite_state_access(e, bindings) {
         *e = replacement;
     }
+}
+
+/// Detect `NavStack(LocalGet(state_id), Array([{name, body}, ...]))` where
+/// `state_id` is one of our state bindings. Lower the call to an IIFE
+/// (closure-as-Call with empty args) whose body:
+///   1. Allocates the host via the existing 0-arg `NavStack()` form.
+///   2. For each route: binds the body widget to a fresh local, calls
+///      `widgetAddChild(host, body)`, then `__navstack_register_route(
+///      synth_id, name, body)` which records the route + sets initial
+///      visibility (hides any route whose name doesn't match the current
+///      state value).
+///   3. Returns the host.
+///
+/// The IIFE shape is the same one `try_desugar_reactive_text` uses at
+/// HIR lowering time (`lower.rs:7367`); we replicate it here because
+/// state_desugar runs after AST→HIR lowering and the call site is buried
+/// in expression position (the `body:` of an `App({body: NavStack(...)})`
+/// config), so we can't hoist the construction to surrounding statements.
+///
+/// Routes with non-string `name` literals or shapes other than the canonical
+/// `{ name: string, body: Widget }` object literal silently bail and the
+/// original NavStack call falls through to its 0-arg dispatch (no routing
+/// behavior — same as today's pre-fix behavior, but at least no compile
+/// error). Refs #535.
+fn try_rewrite_navstack(
+    e: &Expr,
+    bindings: &HashMap<LocalId, StateBinding>,
+    fresh: &mut FreshIds,
+) -> Option<Expr> {
+    let (state_id, route_array) = match e {
+        Expr::NativeMethodCall {
+            module,
+            method,
+            object: None,
+            args,
+            ..
+        } if module == "perry/ui" && method == "NavStack" && args.len() == 2 => {
+            let state_id = match &args[0] {
+                Expr::LocalGet(id) => *id,
+                _ => return None,
+            };
+            let route_array = match &args[1] {
+                Expr::Array(items) => items,
+                _ => return None,
+            };
+            (state_id, route_array)
+        }
+        _ => return None,
+    };
+    let binding = bindings.get(&state_id)?;
+    let synth_id = binding.synth_id.clone();
+
+    // Extract (name, body) pairs from each route. Route entries are HIR
+    // anonymous-shape `New { class_name: __AnonShape_<hash>, args: [name,
+    // body] }` — that's what `lower_object_literal` emits for `{name: ...,
+    // body: ...}` (see lower_decl.rs's anon-shape harvest). We don't try
+    // to handle other shapes (spread, dynamic property keys) — they bail.
+    let mut routes: Vec<(String, Expr)> = Vec::with_capacity(route_array.len());
+    for route in route_array {
+        let shape_args = match route {
+            Expr::New { args, .. } => args,
+            _ => return None,
+        };
+        if shape_args.len() != 2 {
+            return None;
+        }
+        let name = match &shape_args[0] {
+            Expr::String(s) => s.clone(),
+            _ => return None,
+        };
+        let body = shape_args[1].clone();
+        routes.push((name, body));
+    }
+    if routes.is_empty() {
+        return None;
+    }
+
+    let host_id = fresh.fresh_local();
+    let mut body_stmts: Vec<Stmt> = Vec::with_capacity(2 + 3 * routes.len());
+
+    // let __nav_host = NavStack();
+    body_stmts.push(Stmt::Let {
+        id: host_id,
+        name: format!("__nav_host_{}", host_id),
+        ty: Type::Any,
+        mutable: false,
+        init: Some(Expr::NativeMethodCall {
+            module: "perry/ui".to_string(),
+            class_name: None,
+            object: None,
+            method: "NavStack".to_string(),
+            args: vec![],
+        }),
+    });
+
+    for (route_name, route_body) in routes {
+        let route_id = fresh.fresh_local();
+        // let __nav_route_N = <body>;
+        body_stmts.push(Stmt::Let {
+            id: route_id,
+            name: format!("__nav_route_{}", route_id),
+            ty: Type::Any,
+            mutable: false,
+            init: Some(route_body),
+        });
+        // widgetAddChild(__nav_host, __nav_route_N);
+        body_stmts.push(Stmt::Expr(Expr::NativeMethodCall {
+            module: "perry/ui".to_string(),
+            class_name: None,
+            object: None,
+            method: "widgetAddChild".to_string(),
+            args: vec![Expr::LocalGet(host_id), Expr::LocalGet(route_id)],
+        }));
+        // __navstack_register_route("__state_X", "name", __nav_route_N);
+        body_stmts.push(Stmt::Expr(Expr::NativeMethodCall {
+            module: "perry/ui".to_string(),
+            class_name: None,
+            object: None,
+            method: "__navstack_register_route".to_string(),
+            args: vec![
+                Expr::String(synth_id.clone()),
+                Expr::String(route_name),
+                Expr::LocalGet(route_id),
+            ],
+        }));
+    }
+    body_stmts.push(Stmt::Return(Some(Expr::LocalGet(host_id))));
+
+    let func_id = fresh.fresh_func();
+    let closure = Expr::Closure {
+        func_id,
+        params: Vec::<Param>::new(),
+        return_type: Type::Any,
+        body: body_stmts,
+        captures: Vec::new(),
+        mutable_captures: Vec::new(),
+        captures_this: false,
+        enclosing_class: None,
+        is_async: false,
+    };
+    Some(Expr::Call {
+        callee: Box::new(closure),
+        args: vec![],
+        type_args: vec![],
+    })
 }
 
 /// Attempt to rewrite `e` if it matches a state access on a known
