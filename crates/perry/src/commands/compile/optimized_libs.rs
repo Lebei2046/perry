@@ -122,8 +122,35 @@ pub(super) fn build_optimized_libs(
     // through perry-stdlib's tokio. Their workspace-built .a stays
     // fine.
     let mut tokio_using_bindings: Vec<(String, String, Option<String>)> = Vec::new();
+    // Closes #589: hono + node:http combinations dropped js_headers_new /
+    // js_response_new / js_request_new at link time. The well-known flip
+    // strips perry-stdlib's `http-client` feature when `node:http` is
+    // imported and routes to perry-ext-http — but perry-ext-http only
+    // exports the HTTP-client surface (`js_http_*` / `js_node_http_*`),
+    // not the Web Fetch ctors that hono's compiled output references.
+    // perry-ext-fetch is the staticlib that ships those symbols.
+    //
+    // When the user's TS code (or any compilePackages-resolved module like
+    // hono) constructs `new Headers(...)` / `new Request(...)` / `new Response(...)`,
+    // the HIR sets `ctx.uses_fetch = true` (see
+    // `crates/perry-hir/src/destructuring.rs::1469-1492` + the explicit
+    // `fetch(...)` arms in `lower/expr_call.rs`). If that flag is set but
+    // the user didn't *also* import `'fetch'` / `'node-fetch'` (so the
+    // well-known table won't pull perry-ext-fetch in on its own), we
+    // synthetically add `"fetch"` here so the iteration below routes
+    // perry-ext-fetch into the link line. The `'fetch'` binding strips
+    // no perry-stdlib feature (see stdlib_features.rs — fetch falls
+    // through to `_ => &[]`), so this is a pure-add.
+    let mut iteration_set: std::collections::BTreeSet<String> =
+        ctx.native_module_imports.iter().cloned().collect();
+    if ctx.uses_fetch
+        && !iteration_set.contains("fetch")
+        && !iteration_set.contains("node-fetch")
+    {
+        iteration_set.insert("fetch".to_string());
+    }
     if use_well_known {
-        for module in &ctx.native_module_imports {
+        for module in &iteration_set {
             let Some(binding) = super::well_known::lookup_well_known(module) else {
                 continue;
             };
@@ -194,6 +221,23 @@ pub(super) fn build_optimized_libs(
             // `compute_required_features` consulted above, so we
             // know exactly what to remove.
             for feat in crate::commands::stdlib_features::module_to_features(module) {
+                // Fix #589: `node:http` / `node:https` / `node:http2`
+                // map to `http-client`, but that feature also covers
+                // the Web Fetch FFIs (`js_headers_new`,
+                // `js_response_new`, `js_request_new`). When a
+                // compilePackages package — typically hono — uses
+                // `new Headers()` / `new Response()` while the user
+                // also imports `node:http`, stripping `http-client`
+                // breaks the link with undefined `js_headers_new` /
+                // `js_response_new` symbols. perry-ext-http only
+                // bundles the server side (perry-ext-http-server). So
+                // keep `http-client` if `uses_fetch` is set —
+                // perry-stdlib's fetch.rs stays in the build to
+                // satisfy the Web Fetch references; the well-known
+                // staticlib is still added for the server side.
+                if *feat == "http-client" && ctx.uses_fetch {
+                    continue;
+                }
                 features.remove(*feat);
             }
             // perry-ffi's async surface (#466 Phase 1.1 / Phase 5
