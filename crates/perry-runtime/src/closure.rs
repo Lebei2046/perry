@@ -108,8 +108,37 @@ enum DispatchStrategy {
     Direct,
 }
 
+thread_local! {
+    /// Last-resolved (func_ptr, strategy) tuple — single-slot direct cache.
+    /// Avoids the per-call HashMap::get + RefCell::borrow when the same
+    /// closure body is invoked back-to-back, which is the steady-state
+    /// shape of:
+    ///   - microtask drain (same then_v_arrow / __step body each iter)
+    ///   - tight `array.sort` callbacks (same comparator every comparison)
+    ///   - hot `array.map` / `array.forEach` loops
+    /// Cache key is the func_ptr (usize) and is checked with a single
+    /// load + cmp.
+    static DISPATCH_LAST: std::cell::Cell<(usize, DispatchStrategy)> =
+        const { std::cell::Cell::new((0, DispatchStrategy::Direct)) };
+}
+
 #[inline(always)]
 fn resolve_strategy(func_ptr: *const u8) -> DispatchStrategy {
+    let key = func_ptr as usize;
+    // Inline single-slot cache: 90%+ of microtask-drain hot paths
+    // dispatch the same func_ptr back-to-back. One Cell::get + one cmp
+    // beats the RefCell::borrow + HashMap::get of DISPATCH_CACHE.
+    let last = DISPATCH_LAST.with(|c| c.get());
+    if last.0 == key {
+        return last.1;
+    }
+    let strategy = resolve_strategy_slow(func_ptr);
+    DISPATCH_LAST.with(|c| c.set((key, strategy)));
+    strategy
+}
+
+#[inline(never)]
+fn resolve_strategy_slow(func_ptr: *const u8) -> DispatchStrategy {
     let key = func_ptr as usize;
     // Fast path: read existing cache entry.
     if let Some(s) = DISPATCH_CACHE.with(|c| c.borrow().get(&key).copied()) {

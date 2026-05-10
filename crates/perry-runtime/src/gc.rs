@@ -3623,6 +3623,12 @@ pub fn gc_init() {
     // generator state-machine's `__iter` and `__step` boxes that hold
     // the iter object + step closure across awaits).
     gc_register_root_scanner(crate::r#box::scan_box_roots);
+    // Iter-result scratch slot — the async-step fast path stows the
+    // generator's most recent yield value here; it stays live until
+    // the step driver reads it back.
+    gc_register_root_scanner(crate::promise::scan_iter_result_root);
+    // Async-step thunk single-slot cache (build_async_step_thunks).
+    gc_register_root_scanner(crate::promise::scan_async_step_thunk_cache);
     #[cfg(feature = "ohos-napi")]
     gc_register_root_scanner(crate::arkts_callbacks::arkts_callbacks_root_scanner);
 }

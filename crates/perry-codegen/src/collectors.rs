@@ -6084,6 +6084,8 @@ fn check_object_literal_escapes_in_expr(
         // Time / perf leaf intrinsics
         | Expr::DateNow | Expr::PerformanceNow | Expr::MathRandom
         | Expr::CryptoRandomUUID
+        // Iter-result scratch (zero-arg leaves)
+        | Expr::IterResultGetValue | Expr::IterResultGetDone
         // Process leaf intrinsics
         | Expr::ProcessCwd | Expr::ProcessUptime | Expr::ProcessArgv
         | Expr::ProcessMemoryUsage | Expr::ProcessPid | Expr::ProcessPpid

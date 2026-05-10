@@ -7899,6 +7899,51 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         // -------- performance.now() — sub-millisecond resolution --------
         Expr::PerformanceNow => Ok(ctx.block().call(DOUBLE, "js_performance_now", &[])),
 
+        // -------- async-step iter-result scratch helpers --------
+        // Emitted only by the generator transform for `was_plain_async`
+        // functions. The state machine writes (value, done) via
+        // `IterResultSet`; the async-step driver reads them back via
+        // `IterResultGetValue` / `IterResultGetDone`. Eliminates the
+        // per-await `{value, done}` heap alloc on the hot path.
+        Expr::IterResultSet(value, done) => {
+            let v_box = lower_expr(ctx, value)?;
+            let done_str = if *done { "1" } else { "0" };
+            let blk = ctx.block();
+            Ok(blk.call(
+                DOUBLE,
+                "js_iter_result_set",
+                &[(DOUBLE, &v_box), (I32, done_str)],
+            ))
+        }
+        Expr::IterResultGetValue => {
+            Ok(ctx.block().call(DOUBLE, "js_iter_result_get_value", &[]))
+        }
+        Expr::IterResultGetDone => {
+            // Returns NaN-boxed bool (TAG_TRUE / TAG_FALSE) directly,
+            // so it can be used in any conditional / property context
+            // without a separate bool-to-JSValue conversion.
+            Ok(ctx.block().call(DOUBLE, "js_iter_result_get_done", &[]))
+        }
+
+        // -------- Optimized async-step chain (perf hot path) --------
+        // Equivalent to `Promise.resolve(value).then(v => step(v, false), e => step(e, true))`
+        // but skips the wrapper-arrow allocations + dispatches.
+        Expr::AsyncStepChain {
+            value,
+            step_closure,
+        } => {
+            let value_box = lower_expr(ctx, value)?;
+            let step_box = lower_expr(ctx, step_closure)?;
+            let blk = ctx.block();
+            let step_handle = unbox_to_i64(blk, &step_box);
+            let promise_handle = blk.call(
+                I64,
+                "js_async_step_chain",
+                &[(DOUBLE, &value_box), (I64, &step_handle)],
+            );
+            Ok(nanbox_pointer_inline(blk, &promise_handle))
+        }
+
         // -------- Object.getOwnPropertyNames(obj) --------
         // Returns ALL own keys (including non-enumerable ones from
         // defineProperty), unlike Object.keys which skips them.

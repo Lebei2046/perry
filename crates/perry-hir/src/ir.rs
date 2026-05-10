@@ -1272,6 +1272,29 @@ pub enum Expr {
     /// queueMicrotask(callback) -> void
     QueueMicrotask(Box<Expr>),
 
+    /// Async-step iter-result scratch helpers — used by the
+    /// async-to-generator transform's state machine and step driver.
+    /// Eliminate the per-await `{value, done}` heap alloc on the
+    /// async hot path. `IterResultSet(value, done)` writes to a
+    /// thread-local pair and returns `undefined`; the matching
+    /// `IterResultGetValue` / `IterResultGetDone` read them back.
+    /// Only emitted by the generator transform for `was_plain_async`
+    /// functions — never by user code.
+    IterResultSet(Box<Expr>, bool),
+    IterResultGetValue,
+    IterResultGetDone,
+
+    /// Optimized async-step chain: equivalent to
+    /// `Promise.resolve(value).then(v => step(v, false), e => step(e, true))`
+    /// but skips the two arrow-wrapper closure allocations + dispatches
+    /// by carrying the step closure directly through the task queue.
+    /// Only emitted by `build_async_step_driver_direct` — never by user
+    /// code.
+    AsyncStepChain {
+        value: Box<Expr>,
+        step_closure: Box<Expr>,
+    },
+
     // Crypto operations
     CryptoRandomBytes(Box<Expr>), // crypto.randomBytes(size) -> string (hex)
     CryptoRandomUUID,             // crypto.randomUUID() -> string

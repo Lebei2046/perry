@@ -2292,6 +2292,20 @@ pub fn declare_stdlib_ffi(module: &mut LlModule) {
     // ========== Performance ==========
     module.declare_function("js_performance_now", DOUBLE, &[]);
 
+    // ========== Async-step iter-result scratch (perf hot path) ==========
+    // See promise.rs::ITER_RESULT_VALUE / ITER_RESULT_DONE — eliminates
+    // the per-await {value, done} object alloc by stowing both fields
+    // in a thread-local cell that the async-step driver consumes
+    // immediately.
+    module.declare_function("js_iter_result_set", DOUBLE, &[DOUBLE, I32]);
+    module.declare_function("js_iter_result_get_value", DOUBLE, &[]);
+    module.declare_function("js_iter_result_get_done", DOUBLE, &[]);
+    // Optimized async-step chain: replaces
+    // `Promise.resolve(value).then(then_v_arrow, then_e_arrow)` in
+    // the async-step driver by carrying `step_closure` directly
+    // through the task queue.
+    module.declare_function("js_async_step_chain", I64, &[DOUBLE, I64]);
+
     // ========== Slugify ==========
     module.declare_function("js_slugify", I64, &[I64]);
     module.declare_function("js_slugify_strict", I64, &[I64]);

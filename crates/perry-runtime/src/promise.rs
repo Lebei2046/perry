@@ -85,6 +85,71 @@ fn mt_profile_register() {
     });
 }
 
+// ─── Iter-result scratch slot (async-step driver fast path) ───────
+//
+// `await x` rewrites to a generator state machine whose `next()`
+// closure used to allocate `{value, done}` per call (one alloc per
+// await, plus two PropertyGet linear scans by the async-step driver
+// that immediately consumes both fields). On a 200k-await benchmark
+// that's 200k object allocs purely as a 2-field carrier between
+// generator and step driver.
+//
+// We replace the alloc with a thread-local pair: the state machine
+// writes (value, done) via `js_iter_result_set` and returns `undefined`;
+// the step driver reads them back via `js_iter_result_get_value` /
+// `js_iter_result_get_done`. The slot is overwritten on every
+// `next()` call — safe because the async-step driver synchronously
+// consumes both fields immediately after the call returns, with no
+// intervening generator activity.
+//
+// The transform only emits these helpers for `was_plain_async`
+// generators (async functions rewritten via async→generator). User-
+// visible generators (`function*`) still allocate real `{value, done}`
+// objects so `for...of` and external consumers see the spec shape.
+thread_local! {
+    static ITER_RESULT_VALUE: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+    static ITER_RESULT_DONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub static MT_ITER_RESULT_SET_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Write the iter-result scratch slot. Returns `undefined` so callers
+/// can `return js_iter_result_set(v, d)` from the generator's `next()`
+/// state-machine without a separate trailing `return undefined`.
+#[no_mangle]
+pub extern "C" fn js_iter_result_set(value: f64, done: i32) -> f64 {
+    MT_ITER_RESULT_SET_COUNT.fetch_add(1, Ordering::Relaxed);
+    ITER_RESULT_VALUE.with(|c| c.set(value));
+    ITER_RESULT_DONE.with(|c| c.set(done != 0));
+    f64::from_bits(crate::value::TAG_UNDEFINED)
+}
+
+/// Read the value half of the iter-result scratch slot.
+#[no_mangle]
+pub extern "C" fn js_iter_result_get_value() -> f64 {
+    ITER_RESULT_VALUE.with(|c| c.get())
+}
+
+/// Read the done half as a NaN-boxed bool (TAG_TRUE / TAG_FALSE) so it
+/// can flow into any control-flow / property context without a
+/// separate conversion.
+#[no_mangle]
+pub extern "C" fn js_iter_result_get_done() -> f64 {
+    const TAG_TRUE: u64 = 0x7FFC_0000_0000_0004;
+    const TAG_FALSE: u64 = 0x7FFC_0000_0000_0003;
+    let d = ITER_RESULT_DONE.with(|c| c.get());
+    f64::from_bits(if d { TAG_TRUE } else { TAG_FALSE })
+}
+
+/// GC root scanner. The value half can hold pointer NaN-box values
+/// (Promise pointers, object pointers from awaited values); register
+/// this with the GC so they survive a collection that lands between
+/// `js_iter_result_set` and the next `js_iter_result_get_value`.
+pub fn scan_iter_result_root(mark: &mut dyn FnMut(f64)) {
+    let v = ITER_RESULT_VALUE.with(|c| c.get());
+    mark(v);
+}
+
 /// Promise state
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -145,6 +210,13 @@ impl Promise {
 enum Task {
     Promise(*mut Promise, f64, bool),
     Inline(ClosurePtr, f64, *mut Promise, bool),
+    /// Direct dispatch to a 2-arg async-step closure. Equivalent to
+    /// `Inline(then_v_arrow, value, next, true)` where `then_v_arrow`
+    /// is a wrapper that calls `step(value, is_error)` — but skips the
+    /// then_v_arrow alloc + dispatch by carrying `step_closure` and
+    /// the `is_error` flag directly. Saves one closure allocation
+    /// per await on the steady-state primitive-await path.
+    AsyncStep(ClosurePtr, f64, *mut Promise, bool),
 }
 
 // Global task queue for pending promise callbacks. Must be FIFO per
@@ -296,9 +368,36 @@ pub extern "C" fn js_promise_resolve_with_promise(outer: *mut Promise, inner: *m
                 js_promise_reject(outer, (*inner).reason);
             }
             PromiseState::Pending => {
-                // Inner is pending - schedule resolution when inner settles
-                // We create a closure that captures the outer promise pointer
-                // and resolves it when called with the inner's value
+                // Inner is pending.
+                //
+                // Perf fast path: if inner has no callbacks AND no
+                // chained `next` already, we can simply chain outer
+                // as inner's next. When inner settles, the microtask
+                // runner's "callback null but next non-null" arm at
+                // `js_promise_run_microtasks` will propagate the
+                // value/reason to outer directly — same observable
+                // semantics as forward_resolve/forward_reject but
+                // skips two closure allocations AND a microtask hop.
+                //
+                // This is the steady-state shape inside the async-
+                // step driver: each await's `step()` returns a fresh
+                // promise from `Promise.resolve(v).then(...)` whose
+                // `next` is null and whose callbacks were just set
+                // on the inner source — the returned outer wrapper
+                // itself is callback-less. Eliminating that hop is
+                // the largest single win in the per-await steady
+                // state.
+                if (*inner).on_fulfilled.is_null()
+                    && (*inner).on_rejected.is_null()
+                    && (*inner).next.is_null()
+                {
+                    (*inner).next = outer;
+                    return;
+                }
+
+                // Slow path: inner already has callbacks or a chained
+                // `next`. Fall back to the forwarding-closure shape
+                // so we don't clobber existing wiring.
                 let outer_i64 = outer as i64;
 
                 // Create a resolve forwarding closure
@@ -413,6 +512,47 @@ pub extern "C" fn js_promise_then(
     }
 
     next
+}
+
+/// Like `js_promise_then` but skips the allocation of a chained `next`
+/// promise. Used by callers that only need the side effect of running
+/// the handler (Promise.all, Promise.race, internal forwarders), not
+/// the chained promise. Saves one Promise alloc per call — material on
+/// Promise.all of N inputs which today allocates N never-used `next`
+/// promises.
+pub(crate) fn js_promise_attach_handlers(
+    promise: *mut Promise,
+    on_fulfilled: ClosurePtr,
+    on_rejected: ClosurePtr,
+) {
+    if promise.is_null() {
+        return;
+    }
+    unsafe {
+        (*promise).on_fulfilled = on_fulfilled;
+        (*promise).on_rejected = on_rejected;
+        // No next — caller doesn't want a chained promise.
+
+        match (*promise).state {
+            PromiseState::Fulfilled => {
+                if !on_fulfilled.is_null() {
+                    TASK_QUEUE.with(|q| {
+                        q.borrow_mut()
+                            .push_back(Task::Promise(promise, (*promise).value, true));
+                    });
+                }
+            }
+            PromiseState::Rejected => {
+                if !on_rejected.is_null() {
+                    TASK_QUEUE.with(|q| {
+                        q.borrow_mut()
+                            .push_back(Task::Promise(promise, (*promise).reason, false));
+                    });
+                }
+            }
+            PromiseState::Pending => {}
+        }
+    }
 }
 
 /// Register rejection callback, returns a new promise for chaining
@@ -792,6 +932,54 @@ pub extern "C" fn js_promise_run_microtasks() -> i32 {
                 }
                 ran += 1;
             }
+            Some(Task::AsyncStep(step_closure, value, next, is_error)) => {
+                MT_RUN_COUNT.fetch_add(1, Ordering::Relaxed);
+                // Direct dispatch of the async-step closure. Skips the
+                // then_v_arrow / then_e_arrow wrapper that would
+                // otherwise be invoked as the on_fulfilled / on_rejected
+                // callback — the wrapper just calls
+                // `__step(value, is_error)` which is exactly what we do
+                // here with two fewer indirections (closure alloc +
+                // closure call).
+                if step_closure.is_null() {
+                    if !next.is_null() {
+                        if is_error {
+                            js_promise_reject(next, value);
+                        } else {
+                            js_promise_resolve(next, value);
+                        }
+                    }
+                    ran += 1;
+                    continue;
+                }
+                INLINE_TRAP_NEXT.with(|c| c.set(next));
+
+                let t1 = if prof { Some(std::time::Instant::now()) } else { None };
+                let is_error_bits = if is_error {
+                    f64::from_bits(0x7FFC_0000_0000_0004) // TAG_TRUE
+                } else {
+                    f64::from_bits(0x7FFC_0000_0000_0003) // TAG_FALSE
+                };
+                let result = unsafe {
+                    crate::closure::js_closure_call2(step_closure, value, is_error_bits)
+                };
+                if let Some(t) = t1 {
+                    MT_TIME_NS_CALLBACK
+                        .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
+
+                INLINE_TRAP_NEXT.with(|c| c.set(std::ptr::null_mut()));
+
+                let t2 = if prof { Some(std::time::Instant::now()) } else { None };
+                if !next.is_null() {
+                    propagate_callback_result(result, next);
+                }
+                if let Some(t) = t2 {
+                    MT_TIME_NS_RESOLVE
+                        .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
+                ran += 1;
+            }
         }
     }
 
@@ -948,6 +1136,130 @@ pub extern "C" fn js_promise_resolved_then(
     // the unfused path so the assimilation probes can run on it.
     let p1 = js_promise_resolved(value);
     js_promise_then(p1, on_fulfilled, on_rejected)
+}
+
+/// Specialized version of `js_promise_resolved_then` for the async-step
+/// driver's per-`await` lowering: equivalent to
+/// `Promise.resolve(value).then(v => step(v, false), e => step(e, true))`
+/// but skips the `then_v_arrow` / `then_e_arrow` wrapper closures
+/// entirely by carrying `step_closure` directly through the task queue
+/// and invoking it as a 2-arg call at dispatch time.
+///
+/// Primary perf wins:
+///   - One fewer closure allocation per await on the primitive-value
+///     fast path (was: `Task::Inline` carrying `then_v_arrow`; is now
+///     `Task::AsyncStep` carrying `step_closure`).
+///   - One fewer closure dispatch per microtask (was: `then_v_arrow`
+///     body called `step_closure`; is now `step_closure` is invoked
+///     directly by the runner).
+#[no_mangle]
+pub extern "C" fn js_async_step_chain(
+    value: f64,
+    step_closure: ClosurePtr,
+) -> *mut Promise {
+    if is_definitely_primitive(value) {
+        MT_FAST_PATH_HIT.fetch_add(1, Ordering::Relaxed);
+        let next = js_promise_new();
+        TASK_QUEUE.with(|q| {
+            q.borrow_mut()
+                .push_back(Task::AsyncStep(step_closure, value, next, false));
+        });
+        crate::event_pump::js_notify_main_thread();
+        return next;
+    }
+    // For the promise/thenable case, fall back to the legacy
+    // `Promise.resolve(value).then(then_v_arrow, then_e_arrow)` shape
+    // — we don't have wrapper closures here, so we can't skip them.
+    // The codegen emits this case rarely (await-of-a-Promise is a
+    // small fraction of the steady state; primitive awaits dominate),
+    // so the slow path is not yet specialized. To avoid breaking
+    // dispatch we just panic — codegen will never emit this call
+    // with a non-primitive `value` (see lower_call.rs).
+    //
+    // NOTE: this branch is unreachable from the codegen, but kept
+    // for ABI safety if future code calls this directly.
+    let (fulfill, reject) = build_async_step_thunks(step_closure);
+    if js_value_is_promise(value) != 0 {
+        let inner = crate::value::js_nanbox_get_pointer(value) as *mut Promise;
+        if !inner.is_null() {
+            return js_promise_then(inner, fulfill, reject);
+        }
+    }
+    let p = js_promise_resolved(value);
+    js_promise_then(p, fulfill, reject)
+}
+
+// Thread-local single-slot cache for async-step thunks. Keyed by the
+// step closure pointer. When the same step closure is used across
+// multiple promise-of-promise awaits (the simple-probe shape), we
+// return the cached thunks; otherwise we allocate. The thunks are
+// GC-rooted via `ASYNC_STEP_THUNK_CACHE_SCANNER` so they survive
+// collection until evicted by a different step closure.
+thread_local! {
+    static LAST_ASYNC_STEP_THUNKS: std::cell::Cell<(usize, *mut crate::closure::ClosureHeader, *mut crate::closure::ClosureHeader)> =
+        const { std::cell::Cell::new((0, std::ptr::null_mut(), std::ptr::null_mut())) };
+}
+
+/// GC root scanner for the LAST_ASYNC_STEP_THUNKS cache.
+pub fn scan_async_step_thunk_cache(mark: &mut dyn FnMut(f64)) {
+    let (_, f, r) = LAST_ASYNC_STEP_THUNKS.with(|c| c.get());
+    if !f.is_null() {
+        let boxed = f64::from_bits(
+            0x7FFD_0000_0000_0000 | (f as u64 & 0x0000_FFFF_FFFF_FFFF),
+        );
+        mark(boxed);
+    }
+    if !r.is_null() {
+        let boxed = f64::from_bits(
+            0x7FFD_0000_0000_0000 | (r as u64 & 0x0000_FFFF_FFFF_FFFF),
+        );
+        mark(boxed);
+    }
+}
+
+/// Build (fulfill, reject) thunks for the async-step promise-chain
+/// fallback. Uses LAST_ASYNC_STEP_THUNKS as a single-slot cache —
+/// hits 100% in the simple-probe shape (one step closure across all
+/// awaits) while degrading gracefully (no cache overhead beyond the
+/// cell read/write) when many distinct step closures interleave (the
+/// Promise.all-of-N shape).
+fn build_async_step_thunks(
+    step_closure: ClosurePtr,
+) -> (ClosurePtr, ClosurePtr) {
+    let key = step_closure as usize;
+    let cached = LAST_ASYNC_STEP_THUNKS.with(|c| c.get());
+    if cached.0 == key && !cached.1.is_null() && !cached.2.is_null() {
+        return (cached.1 as ClosurePtr, cached.2 as ClosurePtr);
+    }
+    use crate::closure::{js_closure_alloc, js_closure_set_capture_ptr};
+    let fulfill = js_closure_alloc(async_step_fulfill_thunk as *const u8, 1);
+    js_closure_set_capture_ptr(fulfill, 0, step_closure as i64);
+    let reject = js_closure_alloc(async_step_reject_thunk as *const u8, 1);
+    js_closure_set_capture_ptr(reject, 0, step_closure as i64);
+    LAST_ASYNC_STEP_THUNKS.with(|c| c.set((key, fulfill, reject)));
+    (fulfill as ClosurePtr, reject as ClosurePtr)
+}
+
+// Thunks for the promise/thenable fallback in js_async_step_chain.
+// Capture layout: [step_closure_ptr]
+extern "C" fn async_step_fulfill_thunk(
+    closure: *const crate::closure::ClosureHeader,
+    value: f64,
+) -> f64 {
+    let step = crate::closure::js_closure_get_capture_ptr(closure, 0)
+        as *const crate::closure::ClosureHeader;
+    let false_bits = f64::from_bits(0x7FFC_0000_0000_0003);
+    crate::closure::js_closure_call2(step, value, false_bits)
+}
+
+extern "C" fn async_step_reject_thunk(
+    closure: *const crate::closure::ClosureHeader,
+    value: f64,
+) -> f64 {
+    let step = crate::closure::js_closure_get_capture_ptr(closure, 0)
+        as *const crate::closure::ClosureHeader;
+    let true_bits = f64::from_bits(0x7FFC_0000_0000_0004);
+    crate::closure::js_closure_call2(step, value, true_bits)
 }
 
 /// `Array.fromAsync(input)` — Node 22+ static method.
@@ -1375,8 +1687,11 @@ pub extern "C" fn js_promise_all(promises_arr: *const crate::array::ArrayHeader)
         js_closure_set_capture_ptr(reject_closure, 0, result_promise as i64);
         js_closure_set_capture_ptr(reject_closure, 1, state_arr as i64);
 
-        // Attach handlers to the promise
-        js_promise_then(promise_ptr, fulfill_closure, reject_closure);
+        // Attach handlers to the promise WITHOUT allocating a `next`
+        // Promise — the return of `then` is unused here. Saves one
+        // promise alloc per input on Promise.all (50k for the
+        // 1000-batch × 50-input bench).
+        js_promise_attach_handlers(promise_ptr, fulfill_closure, reject_closure);
     }
 
     // Check if all were non-promises (already resolved)
@@ -1515,7 +1830,7 @@ pub extern "C" fn js_promise_race(promises_arr: *const crate::array::ArrayHeader
 
         // Attach handlers via then — if the input is already settled this will
         // push a microtask rather than resolving result_promise synchronously.
-        js_promise_then(promise_ptr, resolve_closure, reject_closure);
+        js_promise_attach_handlers(promise_ptr, resolve_closure, reject_closure);
     }
 
     result_promise
@@ -1810,7 +2125,7 @@ pub extern "C" fn js_promise_all_settled(
         js_closure_set_capture_ptr(reject_closure, 2, state_arr as i64);
         js_closure_set_capture_f64(reject_closure, 3, i as f64);
 
-        js_promise_then(promise_ptr, fulfill_closure, reject_closure);
+        js_promise_attach_handlers(promise_ptr, fulfill_closure, reject_closure);
     }
 
     // If all were already non-promises
@@ -1957,7 +2272,7 @@ pub extern "C" fn js_promise_any(promises_arr: *const crate::array::ArrayHeader)
         js_closure_set_capture_ptr(reject_closure, 2, state_arr as i64);
         js_closure_set_capture_f64(reject_closure, 3, i as f64);
 
-        js_promise_then(promise_ptr, fulfill_closure, reject_closure);
+        js_promise_attach_handlers(promise_ptr, fulfill_closure, reject_closure);
     }
 
     result_promise
@@ -2041,6 +2356,22 @@ pub fn scan_promise_roots(mark: &mut dyn FnMut(f64)) {
                     mark(*value);
                 }
                 Task::Inline(cb, value, next, _) => {
+                    if !cb.is_null() {
+                        let boxed = f64::from_bits(
+                            0x7FFD_0000_0000_0000 | (*cb as u64 & 0x0000_FFFF_FFFF_FFFF),
+                        );
+                        mark(boxed);
+                    }
+                    if !next.is_null() {
+                        let boxed = f64::from_bits(
+                            0x7FFD_0000_0000_0000
+                                | (*next as u64 & 0x0000_FFFF_FFFF_FFFF),
+                        );
+                        mark(boxed);
+                    }
+                    mark(*value);
+                }
+                Task::AsyncStep(cb, value, next, _) => {
                     if !cb.is_null() {
                         let boxed = f64::from_bits(
                             0x7FFD_0000_0000_0000 | (*cb as u64 & 0x0000_FFFF_FFFF_FFFF),

@@ -95,6 +95,8 @@ where
         | Expr::PathSep
         | Expr::PathDelimiter
         | Expr::PerformanceNow
+        | Expr::IterResultGetValue
+        | Expr::IterResultGetDone
         | Expr::TextEncoderNew
         | Expr::TextDecoderNew
         | Expr::CryptoRandomUUID
@@ -220,6 +222,7 @@ where
         | Expr::DecodeURIComponent(v)
         | Expr::StructuredClone(v)
         | Expr::QueueMicrotask(v)
+        | Expr::IterResultSet(v, _)
         | Expr::CryptoRandomBytes(v)
         | Expr::CryptoSha256(v)
         | Expr::CryptoMd5(v)
@@ -720,6 +723,13 @@ where
             f(string);
             f(pattern);
             f(replacement);
+        }
+        Expr::AsyncStepChain {
+            value,
+            step_closure,
+        } => {
+            f(value);
+            f(step_closure);
         }
 
         // ─── Buffer family ───────────────────────────────────────────────
@@ -1240,6 +1250,8 @@ where
         | Expr::PathSep
         | Expr::PathDelimiter
         | Expr::PerformanceNow
+        | Expr::IterResultGetValue
+        | Expr::IterResultGetDone
         | Expr::TextEncoderNew
         | Expr::TextDecoderNew
         | Expr::CryptoRandomUUID
@@ -1365,6 +1377,7 @@ where
         | Expr::DecodeURIComponent(v)
         | Expr::StructuredClone(v)
         | Expr::QueueMicrotask(v)
+        | Expr::IterResultSet(v, _)
         | Expr::CryptoRandomBytes(v)
         | Expr::CryptoSha256(v)
         | Expr::CryptoMd5(v)
@@ -1851,6 +1864,13 @@ where
             f(string);
             f(pattern);
             f(replacement);
+        }
+        Expr::AsyncStepChain {
+            value,
+            step_closure,
+        } => {
+            f(value);
+            f(step_closure);
         }
         Expr::BufferFrom { data, encoding } => {
             f(data);
