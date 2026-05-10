@@ -18,6 +18,13 @@ cairo-rs = "0.20"
 # gtk4 0.10 — both conflict on the gtk-4 `links =` value). OSM tiles by
 # default; no API key required. Pure GtkWidget — no webview.
 libshumate = "0.6"
+# WebView component (#658 Phase 4). webkit6 0.4.x is the last release
+# pinned to gtk4 0.9 matching the rest of perry-ui-gtk4; 0.5+ moved
+# to gtk4 0.10. WebKitGTK 6.0 requires libwebkitgtk-6.0-dev at build
+# time (Ubuntu 22.10+, Debian 12+). The `decide-policy::navigation-action`
+# signal gives the same sync-intercept semantics as WKWebView's
+# decidePolicyForNavigationAction on macOS.
+webkit6 = "=0.4"
 # perry/media — GStreamer playbin for streaming audio playback (#351).
 gstreamer = "0.23"
 # perry/media — MPRIS D-Bus exposure for GNOME / KDE / playerctl /

@@ -3022,6 +3022,73 @@ function perry_ui_image_set_size(h, width, height) {
 }
 function perry_ui_image_set_tint(h, r, g, b, a) { perry_ui_set_foreground(h, r, g, b, a); }
 
+// ---------- WebView (issue #658 Phase 5 web target) ----------
+// Renders an <iframe>. Cross-origin restrictions limit what we can hook:
+// `onShouldNavigate` only fires for same-origin nav (we observe via the
+// `load` event and inspect contentWindow.location); `onLoaded` fires
+// after the iframe's `load` event for any nav; `onError` is delivered
+// when the iframe fails to load (same-origin only). Custom UA is
+// browser-controlled and can't be overridden from JS.
+function perry_ui_webview_create(url, _width, _height) {
+  const el = document.createElement("iframe");
+  el.src = url || "about:blank";
+  el.setAttribute("sandbox", "allow-scripts allow-same-origin allow-forms allow-popups");
+  el.style.border = "0";
+  el.style.width = "100%";
+  el.style.height = "100%";
+  el._perry_state = { allowed: [], onShould: null, onLoaded: null, onError: null };
+  el.addEventListener("load", () => {
+    const st = el._perry_state;
+    let url = "";
+    try { url = el.contentWindow?.location?.href || el.src; } catch { url = el.src; }
+    if (st.onShould && st.allowed.length > 0) {
+      // Best-effort allowlist — for cross-origin URIs, contentWindow throws.
+      try {
+        const host = new URL(url).hostname;
+        const ok = st.allowed.some(d => host === d || host.endsWith("." + d));
+        if (!ok) { el.src = "about:blank"; return; }
+      } catch {}
+    }
+    if (st.onLoaded) st.onLoaded(url);
+  });
+  el.addEventListener("error", () => {
+    const st = el._perry_state;
+    if (st.onError) st.onError(0, "iframe load error");
+  });
+  return uiAlloc(el);
+}
+function perry_ui_webview_set_user_agent(_h, _ua) { /* not configurable from JS */ }
+function perry_ui_webview_set_allowed_domains(h, arr) {
+  const el = uiGet(h); if (!el || !el._perry_state) return;
+  el._perry_state.allowed = Array.isArray(arr) ? arr.slice() : [];
+}
+function perry_ui_webview_set_ephemeral(_h, _e) { /* iframe storage = parent storage; isolation needs a fresh tab */ }
+function perry_ui_webview_set_on_should_navigate(h, cb) { const el = uiGet(h); if (el?._perry_state) el._perry_state.onShould = cb; }
+function perry_ui_webview_set_on_loaded(h, cb) { const el = uiGet(h); if (el?._perry_state) el._perry_state.onLoaded = cb; }
+function perry_ui_webview_set_on_error(h, cb) { const el = uiGet(h); if (el?._perry_state) el._perry_state.onError = cb; }
+function perry_ui_webview_load_url(h, url) { const el = uiGet(h); if (el) el.src = url; }
+function perry_ui_webview_reload(h) {
+  const el = uiGet(h); if (!el) return;
+  try { el.contentWindow?.location?.reload(); } catch { el.src = el.src; }
+}
+function perry_ui_webview_go_back(h) { const el = uiGet(h); if (!el) return; try { el.contentWindow?.history?.back(); } catch {} }
+function perry_ui_webview_go_forward(h) { const el = uiGet(h); if (!el) return; try { el.contentWindow?.history?.forward(); } catch {} }
+function perry_ui_webview_can_go_back(h) {
+  const el = uiGet(h); if (!el) return 0;
+  try { return (el.contentWindow?.history?.length || 0) > 1 ? 1 : 0; } catch { return 0; }
+}
+function perry_ui_webview_evaluate_js(h, js, cb) {
+  const el = uiGet(h); if (!el) { if (cb) cb(""); return; }
+  // Same-origin only — cross-origin contentWindow access throws.
+  try {
+    const result = el.contentWindow?.eval(js);
+    if (cb) cb(result == null ? "" : String(result));
+  } catch {
+    if (cb) cb("");
+  }
+}
+function perry_ui_webview_clear_cookies(_h) { /* iframe shares storage with parent */ }
+
 // ---------- ProgressView ----------
 function perry_ui_progressview_set_value(h, value) { const el = uiGet(h); if (el) { el.max = 1; el.value = value; } }
 

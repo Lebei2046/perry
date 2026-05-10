@@ -2294,31 +2294,60 @@ pub extern "C" fn perry_ui_frame_split_add_child(_parent: i64, _child: i64) {}
 //     and the imperative ops are no-ops; user code that imports WebView
 //     still compiles and runs but the widget is invisible. Real backend
 //     deferred to a later phase per #658's roadmap.
+// --- WebView (issue #658 Phase 4) — real Linux backend via WebKitGTK 6.0.
 #[no_mangle]
-pub extern "C" fn perry_ui_webview_create(_url_ptr: i64, _width: f64, _height: f64) -> i64 { 0 }
+pub extern "C" fn perry_ui_webview_create(url_ptr: i64, width: f64, height: f64) -> i64 {
+    widgets::webview::create(url_ptr as *const u8, width, height)
+}
 #[no_mangle]
-pub extern "C" fn perry_ui_webview_set_user_agent(_handle: i64, _ua_ptr: i64) {}
+pub extern "C" fn perry_ui_webview_set_user_agent(handle: i64, ua_ptr: i64) {
+    widgets::webview::set_user_agent(handle, ua_ptr as *const u8)
+}
 #[no_mangle]
-pub extern "C" fn perry_ui_webview_set_allowed_domains(_handle: i64, _arr_handle: i64) {}
+pub extern "C" fn perry_ui_webview_set_allowed_domains(handle: i64, arr_handle: i64) {
+    widgets::webview::set_allowed_domains(handle, arr_handle)
+}
 #[no_mangle]
-pub extern "C" fn perry_ui_webview_set_ephemeral(_handle: i64, _ephemeral: i64) {}
+pub extern "C" fn perry_ui_webview_set_ephemeral(handle: i64, ephemeral: i64) {
+    widgets::webview::set_ephemeral(handle, ephemeral)
+}
 #[no_mangle]
-pub extern "C" fn perry_ui_webview_set_on_should_navigate(_handle: i64, _closure: f64) {}
+pub extern "C" fn perry_ui_webview_set_on_should_navigate(handle: i64, closure: f64) {
+    widgets::webview::set_on_should_navigate(handle, closure)
+}
 #[no_mangle]
-pub extern "C" fn perry_ui_webview_set_on_loaded(_handle: i64, _closure: f64) {}
+pub extern "C" fn perry_ui_webview_set_on_loaded(handle: i64, closure: f64) {
+    widgets::webview::set_on_loaded(handle, closure)
+}
 #[no_mangle]
-pub extern "C" fn perry_ui_webview_set_on_error(_handle: i64, _closure: f64) {}
+pub extern "C" fn perry_ui_webview_set_on_error(handle: i64, closure: f64) {
+    widgets::webview::set_on_error(handle, closure)
+}
 #[no_mangle]
-pub extern "C" fn perry_ui_webview_load_url(_handle: i64, _url_ptr: i64) {}
+pub extern "C" fn perry_ui_webview_load_url(handle: i64, url_ptr: i64) {
+    widgets::webview::load_url(handle, url_ptr as *const u8)
+}
 #[no_mangle]
-pub extern "C" fn perry_ui_webview_reload(_handle: i64) {}
+pub extern "C" fn perry_ui_webview_reload(handle: i64) {
+    widgets::webview::reload(handle)
+}
 #[no_mangle]
-pub extern "C" fn perry_ui_webview_go_back(_handle: i64) {}
+pub extern "C" fn perry_ui_webview_go_back(handle: i64) {
+    widgets::webview::go_back(handle)
+}
 #[no_mangle]
-pub extern "C" fn perry_ui_webview_go_forward(_handle: i64) {}
+pub extern "C" fn perry_ui_webview_go_forward(handle: i64) {
+    widgets::webview::go_forward(handle)
+}
 #[no_mangle]
-pub extern "C" fn perry_ui_webview_can_go_back(_handle: i64) -> i64 { 0 }
+pub extern "C" fn perry_ui_webview_can_go_back(handle: i64) -> i64 {
+    widgets::webview::can_go_back(handle)
+}
 #[no_mangle]
-pub extern "C" fn perry_ui_webview_evaluate_js(_handle: i64, _js_ptr: i64, _callback: f64) {}
+pub extern "C" fn perry_ui_webview_evaluate_js(handle: i64, js_ptr: i64, callback: f64) {
+    widgets::webview::evaluate_js(handle, js_ptr as *const u8, callback)
+}
 #[no_mangle]
-pub extern "C" fn perry_ui_webview_clear_cookies(_handle: i64) {}
+pub extern "C" fn perry_ui_webview_clear_cookies(handle: i64) {
+    widgets::webview::clear_cookies(handle)
+}

@@ -24,6 +24,7 @@ pub mod textfield;
 pub mod toast;
 pub mod toggle;
 pub mod vstack;
+pub mod webview;
 pub mod zstack;
 
 use jni::objects::{GlobalRef, JObject, JValue};

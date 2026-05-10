@@ -30,6 +30,7 @@ pub mod toast;
 pub mod toggle;
 pub mod tree_view;
 pub mod vstack;
+pub mod webview;
 pub mod zstack;
 
 use gtk4::prelude::*;
