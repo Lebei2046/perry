@@ -738,6 +738,10 @@ where
             f(value);
             f(step_closure);
         }
+        Expr::CurrentStepClosure => {}
+        Expr::AsyncFirstCall { step_closure } => {
+            f(step_closure);
+        }
 
         // ─── Buffer family ───────────────────────────────────────────────
         Expr::BufferFrom { data, encoding } => {
@@ -1884,6 +1888,10 @@ where
             step_closure,
         } => {
             f(value);
+            f(step_closure);
+        }
+        Expr::CurrentStepClosure => {}
+        Expr::AsyncFirstCall { step_closure } => {
             f(step_closure);
         }
         Expr::BufferFrom { data, encoding } => {

@@ -699,18 +699,18 @@ jobs:
           # found in the pkg-config search path". gstreamer-base is the
           # transitive dep gstreamer-base-sys needs for the playbin element
           # that perry/media wraps.
-          # libjavascriptcoregtk-4.1-dev added for the perry/ui-gtk4 WebView
-          # feature (Phases 1-5 + v2 follow-ups, #658): javascriptcore6-sys
-          # in the dep tree of webkit2gtk-6.0 needs `javascriptcoregtk-6.0.pc`
-          # findable via pkg-config. Without it doc-tests-gtk4 fails the
-          # cargo build step with "Package javascriptcoregtk-6.0 was not found
-          # in the pkg-config search path". libwebkit2gtk-4.1-dev pulls
-          # libjavascriptcoregtk-4.1-dev as a transitive dep on ubuntu-24.04.
+          # libwebkitgtk-6.0-dev added for the perry/ui-gtk4 WebView
+          # feature (Phases 1-5 + v2 follow-ups, #658): the `webkit6` crate
+          # (0.4 series) and its transitive `javascriptcore6-sys` need
+          # `webkitgtk-6.0.pc` AND `javascriptcoregtk-6.0.pc` findable via
+          # pkg-config. Ubuntu 24.04 (noble) ships libwebkitgtk-6.0-dev
+          # which provides BOTH .pc files (the old libwebkit2gtk-4.1-dev
+          # name only ships the 4.1 .pc and that's not what webkit6 wants).
           sudo apt-get install -y \
             libgtk-4-dev libadwaita-1-dev xvfb pkg-config \
             libpulse-dev \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-            libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev
+            libwebkitgtk-6.0-dev
 
       - name: Surface Android NDK location (for cross-compile)
         if: matrix.os == 'macos-14' || matrix.os == 'ubuntu-24.04'

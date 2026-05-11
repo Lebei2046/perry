@@ -2336,6 +2336,14 @@ pub fn declare_stdlib_ffi(module: &mut LlModule) {
     // Promise (INLINE_TRAP_NEXT) when called from inside the microtask
     // runner dispatching this same step closure.
     module.declare_function("js_async_step_done", I64, &[DOUBLE, I64]);
+    // #691 Phase 2: returns the live step closure pointer from
+    // INLINE_TRAP.current_step TLS. Codegen NaN-boxes the result.
+    module.declare_function("js_get_current_step_closure", I64, &[]);
+    // #691 Phase 2: wrap the wrapper's initial step invocation with
+    // TLS setup so `js_get_current_step_closure` inside the body sees
+    // the right pointer on the very first state. Saves/restores
+    // INLINE_TRAP across the call for nested-async composition.
+    module.declare_function("js_async_first_call", DOUBLE, &[DOUBLE]);
 
     // ========== Slugify ==========
     module.declare_function("js_slugify", I64, &[I64]);

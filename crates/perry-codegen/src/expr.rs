@@ -8058,6 +8058,26 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             Ok(nanbox_pointer_inline(blk, &promise_handle))
         }
 
+        // -------- #691 Phase 2: current step closure (self-ref) ----
+        // Reads the live step closure pointer from INLINE_TRAP.current_step
+        // TLS and NaN-boxes it. Only safe inside a step body or any
+        // code wrapped by js_async_first_call.
+        Expr::CurrentStepClosure => {
+            let blk = ctx.block();
+            let step_handle = blk.call(I64, "js_get_current_step_closure", &[]);
+            Ok(nanbox_pointer_inline(blk, &step_handle))
+        }
+
+        // -------- #691 Phase 2: first invocation with TLS setup -----
+        // Runtime helper takes the NaN-boxed closure pointer, saves
+        // the previous INLINE_TRAP, sets current_step, calls
+        // js_closure_call2(closure, undefined, false), then restores.
+        Expr::AsyncFirstCall { step_closure } => {
+            let step_box = lower_expr(ctx, step_closure)?;
+            let blk = ctx.block();
+            Ok(blk.call(DOUBLE, "js_async_first_call", &[(DOUBLE, &step_box)]))
+        }
+
         // -------- Object.getOwnPropertyNames(obj) --------
         // Returns ALL own keys (including non-enumerable ones from
         // defineProperty), unlike Object.keys which skips them.

@@ -1318,6 +1318,32 @@ pub enum Expr {
         step_closure: Box<Expr>,
     },
 
+    /// #691 Phase 2. Returns the currently-running step closure as a
+    /// NaN-boxed pointer (read from `INLINE_TRAP.current_step` TLS).
+    /// Used by `build_async_step_driver_direct` to replace the
+    /// `step_id` self-capture inside the step body — eliminates the
+    /// per-invocation `js_box_alloc` for the self-reference and
+    /// shrinks the step closure by one capture slot. Codegen also
+    /// recognizes it as a callee in `Expr::Call` so the catch arm's
+    /// `__step(e, true)` recursive re-entry works without the
+    /// captured local.
+    /// Only emitted by `build_async_step_driver_direct` — never by
+    /// user code.
+    CurrentStepClosure,
+
+    /// #691 Phase 2. Invokes a freshly-built step closure with
+    /// (undefined, false) and the proper `CURRENT_STEP_CLOSURE` TLS
+    /// setup. Used at the bottom of the async-step wrapper in place
+    /// of a direct `__step(undefined, false)` call so that
+    /// `Expr::CurrentStepClosure` inside the body returns the right
+    /// pointer on the very first state transition. The runtime
+    /// helper saves and restores the previous trap state so nested
+    /// async calls compose.
+    /// Only emitted by `build_async_step_driver_direct`.
+    AsyncFirstCall {
+        step_closure: Box<Expr>,
+    },
+
     // Crypto operations
     CryptoRandomBytes(Box<Expr>), // crypto.randomBytes(size) -> string (hex)
     CryptoRandomUUID,             // crypto.randomUUID() -> string
