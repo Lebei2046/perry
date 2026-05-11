@@ -1655,6 +1655,16 @@ pub extern "C" fn js_promise_all(promises_arr: *const crate::array::ArrayHeader)
     js_array_set_f64(state_arr, 0, count as f64); // remaining count
     js_array_set_f64(state_arr, 1, 0.0); // rejected flag (0 = not rejected)
 
+    // Reject closure is identical for every input (captures only
+    // `[result_promise, state_arr]`, no per-index payload). Allocate it
+    // ONCE per Promise.all call and share across all inputs. Saves
+    // (N-1) closure allocations per call — on the 50-input × 1000-batch
+    // bench that's ~50k fewer closures (~2-3 ms on a hot run).
+    let shared_reject_closure =
+        js_closure_alloc(promise_all_reject_handler as *const u8, 2);
+    js_closure_set_capture_ptr(shared_reject_closure, 0, result_promise as i64);
+    js_closure_set_capture_ptr(shared_reject_closure, 1, state_arr as i64);
+
     // For each promise in the array, attach a .then handler
     for i in 0..count {
         let promise_f64 = js_array_get_f64(promises_arr, i);
@@ -1681,17 +1691,11 @@ pub extern "C" fn js_promise_all(promises_arr: *const crate::array::ArrayHeader)
         js_closure_set_capture_ptr(fulfill_closure, 2, state_arr as i64);
         js_closure_set_capture_f64(fulfill_closure, 3, i as f64);
 
-        // Create reject closure for this promise
-        // Captures: [result_promise, state_arr]
-        let reject_closure = js_closure_alloc(promise_all_reject_handler as *const u8, 2);
-        js_closure_set_capture_ptr(reject_closure, 0, result_promise as i64);
-        js_closure_set_capture_ptr(reject_closure, 1, state_arr as i64);
-
         // Attach handlers to the promise WITHOUT allocating a `next`
         // Promise — the return of `then` is unused here. Saves one
         // promise alloc per input on Promise.all (50k for the
         // 1000-batch × 50-input bench).
-        js_promise_attach_handlers(promise_ptr, fulfill_closure, reject_closure);
+        js_promise_attach_handlers(promise_ptr, fulfill_closure, shared_reject_closure);
     }
 
     // Check if all were non-promises (already resolved)
