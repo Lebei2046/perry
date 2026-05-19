@@ -2,6 +2,82 @@
 
 Detailed changelog for Perry. See CLAUDE.md for concise summaries.
 
+## v0.5.1011 — fix(compile) #1110 + chore(ffi) #1112: re-export-only FFI manifest collection; runtime-only-link `perry_ffi_*` undef; perry-ffi to crates.io
+
+Three related changes — all fall out of trying to ship `@perryts/storekit` and similar scoped npm wrappers without a sibling Perry checkout.
+
+### #1110: re-export-only paths missed `perry.nativeLibrary` manifest collection
+
+`#1085` fixed the **direct-import** form (`import { js_foo } from "@perryts/storekit"`) by skipping the wrapper-symbol registration in `import_function_prefixes`, letting `lower_call.rs` fall through to the FFI-manifest path. But the manifest is only added to `ctx.native_libraries` in `collect_modules.rs`'s **import-walk** (line ~700 / ~805) — never in the **re-export-walk** at line ~954. Programs that reach the FFI-bearing package only through a re-export chain (`./wrap` does `export { js_foo } from "@perryts/storekit"`, the entry imports from `./wrap`) had an empty `ctx.native_libraries`, so:
+
+1. `ffi_functions` built in `compile.rs` was empty.
+2. Every module's `opts.native_library_functions` was empty.
+3. `cross_module.ffi_signatures` in every codegen pass was empty.
+4. `lower_call.rs`'s `ffi_signatures.contains_key(name)` returned `false`.
+5. The early-`js_*` check at `lower_call.rs:1288` then **direct-called** the FFI symbol from the consumer's IR — but without ever pushing a matching `declare external` to the module's pending declarations.
+6. clang rejected the IR with `use of undefined value '@js_storekit_get_jws'`.
+
+The matching wrapper symbol (`perry_fn_wrap_ts__js_storekit_get_jws`) was emitted in IR via the closure-wrap stub `__perry_wrap_extern_wrap_ts__js_storekit_get_jws`, so the failure shape varied: sometimes link-time `undefined symbol`, sometimes IR-verifier-time `use of undefined value`.
+
+**Fix.** Mirror the per-kind manifest collection inside the re-export-walk loop: when the re-export source is a package import (not relative), walk up to find a `package.json` with `perry.nativeLibrary`, validate the abiVersion + allowlist exactly as the import-walk does, and push to `ctx.native_libraries`. Adds the standard `Native library: <name> (... FFI functions, via re-export)` log line so the import path is observable.
+
+**Bundled defensive fix in `lower_call.rs`:** force the FFI-manifest path whenever `ctx.ffi_signatures` knows the name, even if some other code path registers an entry in `import_function_prefixes` (the original failure shape from #1110 still required this — the manifest path was correct but the wrapper-prefix path won by accident). Future re-export shapes that leak `import_function_prefixes` entries past the per-specifier skip in `#1085` are now defensively routed through the FFI path.
+
+**Verified.** Reproduced the LLVM IR-verifier failure end-to-end with `import { … } from "./wrap"` re-exporting from `@perryts/storekit`; post-fix `wrap.ts.o` / `main_reexport.ts.o` both reference the plain manifest symbols (`_js_storekit_get_jws`) and the link succeeds.
+
+### #1110 (also): `nativeLibrary` archives left `perry_ffi_*` undefined at link time when stdlib wasn't otherwise needed
+
+The user's actual `/tmp/repro1110_real` reduction (`import { js_storekit_get_jws } from "@perryts/storekit"; await js_storekit_get_jws()`) compiled correctly — `main_ts.o` referenced the plain manifest symbol `_js_storekit_get_jws` — but the **link** then failed with `Undefined symbols for architecture arm64: "_perry_ffi_promise_new" / "_perry_ffi_promise_resolve_bits"`.
+
+The user's TS code didn't import anything from `perry-stdlib`'s public surface (`fs` / `console` aside, neither of which currently triggers stdlib detection on its own), so `ctx.needs_stdlib` stayed `false` and the linker line was `Linking (runtime-only)…`. But every `returns: "promise"` manifest entry in a `perry.nativeLibrary` package compiles, in the wrapper crate, to a perry-ffi `JsPromise::new()` / `JsPromise::resolve_string()` call site — perry-ffi declares those C ABI shims (`perry_ffi_promise_new`, `perry_ffi_promise_resolve_bits`, …) as `extern "C"`, and the *definitions* live in `perry-stdlib::perry_ffi_async`. Without stdlib linked, the references stayed undefined.
+
+**Fix.** In `compile.rs`, right after `ffi_functions` is materialized: `if !ctx.native_libraries.is_empty() { ctx.needs_stdlib = true; }`. Any program with at least one loaded `perry.nativeLibrary` manifest now force-links `libperry_stdlib.a` regardless of whether the user's TS source touched anything else stdlib-shaped.
+
+The user-visible change is one log line — `Linking (runtime-only)…` → `Linking (with stdlib)…` — and the build now reaches `Wrote executable: repro`. Verified end-to-end with `/tmp/repro1110_real`, both the direct-import form (the user's reduction as filed) and the re-export-chain shape from the codegen fix above.
+
+### #1112: publish perry-ffi to crates.io
+
+`perry-ffi` is the stable FFI surface that any `perry.nativeLibrary` wrapper compiles against. Today it lives only at `crates/perry-ffi/` in the monorepo — every npm-distributed wrapper has to write `perry-ffi = { path = "../../../../perry/perry/crates/perry-ffi" }`, which only resolves in a sibling-checkout layout. After `npm install` lands the wrapper inside `node_modules/`, the relative path is unresolvable and `cargo build` bombs with `no matching package named 'perry-ffi'`.
+
+**Changes for crates.io publication:**
+
+- **Cargo.toml metadata:** add `keywords` / `categories` / `readme` to `crates/perry-ffi/Cargo.toml`. Workspace dep entries for `perry-runtime` and `perry-ffi` now carry both `path` (in-tree builds win) and `version` (crates.io resolution metadata).
+- **`runtime-link` feature kept intact** (`runtime-link = ["dep:perry-runtime"]`). Initial attempt at #1112 moved `perry-runtime` to a path-only dev-dep with the feature reduced to a no-op stub — `cargo publish --dry-run` accepted that, but downstream test binaries (`perry-ext-mongodb`, `perry-ext-bcrypt`, …) which set `[dev-dependencies] perry-ffi = { ..., features = ["runtime-link"] }` then failed to link with `undefined symbol: js_string_from_bytes` because the runtime-symbol propagation died with the feature. Restored to the original shape (`perry-runtime = { workspace = true, optional = true }` + feature gate) so the in-tree test dance still works; external (npm-distributed) wrappers leave the feature off and don't pull perry-runtime in, exactly as before.
+
+**Publish prerequisite.** With `perry-runtime` reinstated as an optional dep, `cargo publish -p perry-ffi` now needs `perry-runtime` to exist on crates.io at the matching version — even though `runtime-link` is OFF by default and external consumers never trigger the resolution. `scripts/publish_perry_ffi.sh` checks for the resulting "no matching package named perry-runtime found" error and prints an explicit "publish perry-runtime first" message. Publishing perry-runtime itself is its own multi-step lift (it has paths to other workspace crates) and is left as the tracked follow-up; the metadata in this PR makes the eventual publish step a one-line invocation rather than a deep restructure.
+
+**Verified.** `cargo test --release -p perry-ext-mongodb` (the CI breakage case) compiles and links cleanly. The npm-distributed wrapper pattern (`perry-ffi = "0.5"` with no features) is unchanged from the original optional-dep shape.
+
+Adds `crates/perry-ffi/README.md` as the documentation rendered on crates.io.
+
+### #1113: `FastifyInstance.server` returned a JS number instead of an EventEmitter handle
+
+Pre-fix: `typeof app.server === "number"`, `app.server.on === undefined`, `app.server.on("upgrade", cb)` threw `(number).on is not a function` at boot. shop-admin's `server/realtime/server.ts` registers an upgrade handler at startup, the boot `catch` logged `fatal:`, the process exited — no WebSocket transport possible at all.
+
+Root cause: `app.server` fell through the generic property getter on the FastifyApp handle and returned the raw handle id as a JS number. There was no `js_fastify_app_server` extern, no `.on(…)` arm in the FastifyApp method dispatch, and no NATIVE_MODULE_TABLE row for either.
+
+This PR ships the **minimum boot-unblocking shape**: `app.server` returns the FastifyApp handle pointer-tagged (`typeof === "object"`), `.on(event, cb)` dispatches into a new `js_fastify_app_on` extern that stores upgrade callbacks in `FastifyApp::upgrade_handlers`, the GC scanner pins those closures across cycles, and the hyper accept loop emits a clear `501 Not Implemented` + diagnostic line when an `Upgrade:` request arrives against a registered handler.
+
+The follow-up still owed is the **bidirectional dispatch**: hyper's accept loop doesn't yet call `hyper::upgrade::on(req)` to get the raw upgraded IO, nor does it hand a Node-compatible `req` / `socket` / `head` triple back to TypeScript. Until that lands, user code calling `wss.handleUpgrade(req, socket, head, …)` from inside the registered callback can't complete the WS handshake — the diagnostic at request-dispatch time tells the user to use `perry-ext-ws` on a separate port. This is the same restriction the in-tree fastify code documents at `crates/perry-ext-fastify/src/lib.rs`'s "Punted gaps" section.
+
+Codegen path: a `Call { callee: PropertyGet { object: NativeMethodCall { module, … }, property: P }, args }` chain is now forwarded into the `NATIVE_MODULE_TABLE` arm for `(module, P)` whenever the table recognises `P` as a method of `module`. The HIR shape pre-PR (TypeScript's structural typing doesn't propagate the native-module tag through a `.server` return) had the property read returning undefined and the call silently no-op'd (`(undefined)(…)` returns NaN in Perry's runtime today — no exception). The forward is scoped narrowly — falls back to the existing generic Call lowering if the lookup misses. Verified end-to-end with the repro under `/tmp/repro1113`: boot completes cleanly, `app.server.on("upgrade", cb)` registers the closure (visible via the FastifyApp registry), and a probe with `Upgrade: websocket` headers gets the new 501 diagnostic.
+
+Mirror changes landed in both perry-stdlib's `crate::fastify` (the `bundled-fastify` path) and `perry-ext-fastify` (the auto-optimize-flipped path) since either can be live depending on whether `import 'fastify'` got routed through the well-known flip. Inadvertently testing this surfaced that the auto-optimize cache (`target/perry-auto-<hash>/`) doesn't always invalidate on perry-stdlib / perry-ext-fastify source touches — once during development the rebuild produced a stale lib without the new symbols. `rm -rf target/perry-auto-*` between rebuilds was needed; the proper cache-invalidation fix is its own follow-up (#TBD).
+
+### #1114: regression sanity-check + bisect harness (root cause still pending real repro)
+
+The user reports `setInterval` + async `@perryts/mysql` query loop wedges the runtime on v0.5.1009 (worked on v0.5.1008), with `madvise` hot in the sample profile — a GC-thrash / tight-allocation signature. Investigation here:
+
+1. **My synthetic repro didn't trigger it.** Reduced the user's pattern to fastify + setInterval(1s) + an awaiting tick (`/tmp/repro1114/main.ts`), no MySQL — CPU stayed at 0%, healthz responded in milliseconds. Added a real-MySQL variant against a local server (`/tmp/repro1114_real/main.ts`, `createPool` + `FOR UPDATE SKIP LOCKED`) — still 0% CPU. shop-admin's ~68-server-file compile unit appears to be a load-bearing part of the trigger condition (more module init / closure pinning / GC pressure) that the minimal shape doesn't recreate. Matches the user's own observation that their minimal repro didn't trigger it.
+2. **Diff inventory between v0.5.1008 (`0a908394`) and v0.5.1009 (`c71c780b`).** The CHANGELOG entry for v0.5.1009 only mentions the misaligned-pointer `Object.assign` fix, but `git log --first-parent` shows 9 other on-main commits in the range — none of which bumped the version themselves, all surfacing as one combined v0.5.1009 release. The fastify-flavoured candidates (most likely given the user's symptom set) ordered from most-to-least suspect:
+   - **`634e1f58`** `fix(fastify): non-blocking listen() + main-thread pump (#1066)` — adds `js_fastify_process_pending` to `js_stdlib_process_pending`. Every main-pump tick now walks every `FastifyServerHandle` and tries to drain its mpsc — an `iter_handle_ids_of` allocation per tick. If `js_wait_for_event`'s budget computation hits 0 (any pending timer past its deadline), the pump runs without blocking and the per-tick allocations could plausibly produce the observed `madvise` storm.
+   - `3856caad` `fix(transform): #1047 — async early return followed by an unreached await` — extends the generator transform to rewrite returns inside `StateExit::Yield` bodies. Pure codegen-time change; unlikely to cause runtime regression but listed for completeness.
+   - `52847008` `fix(jsruntime): break V8-fallback CJS require cycles + process.exit shim` — V8-side change; the user's code doesn't appear to hit the V8 fallback path, but ruling it out requires the actual repro.
+   - `7e3bd5a4` `fix(codegen): #321 — Effect.succeed via named-import-of-namespace-reexport` — codegen narrowing change; shouldn't manifest at runtime, but could change the closure-allocation shape for affected re-export patterns.
+3. **Bisect script.** `scripts/bisect_1114.sh` walks first-parent commits in the candidate range, rebuilds runtime+stdlib+perry at each step, runs `$PERRY_REPRO_CMD`, samples CPU twice (after 5s and 10s), and reports the first commit where CPU exceeds `$PERRY_REPRO_CPU_LIMIT` (default 80%). The user can run this against their actual shop-admin binary to localise the regression in ~15 minutes. Expecting `634e1f58` to be the bad commit given the symptom shape — but the script makes that empirical rather than speculative.
+
+The actual fix needs the user's reproducer because the diagnostic ("which commit?") depends on running their actual code under each commit. Once the bad commit is known, the fix is likely targeted: either narrow the pump's per-tick allocations in `js_fastify_process_pending`, or fix `js_wait_for_event`'s budget computation so pending micro-tasks don't force a 0ms wait. Documented further follow-up here so the next iteration has a starting point.
+
 ## v0.5.1010 — fix(crypto): #1111 — CipherHandle property reads return bound-method closures so `c.getAuthTag?.()` doesn't short-circuit
 
 #1075 wired the runtime side of `createCipheriv("aes-256-gcm", ...)` —
