@@ -311,3 +311,9 @@ perry-codegen-wear-tiles = { path = "crates/perry-codegen-wear-tiles" }
 perry-codegen-wasm = { path = "crates/perry-codegen-wasm" }
 perry-ui-testkit = { path = "crates/perry-ui-testkit" }
 perry-updater = { path = "crates/perry-updater" }
+
+# Patch aws-lc-sys to fix missing poly_rq_mul.S for Linux x86_64
+# The upstream crate omits crypto/hrss/asm/poly_rq_mul.S from the linux_x86_64 build,
+# causing undefined symbol errors when linking. See: patches/aws-lc-sys-0.40.0-add-poly_rq_mul.patch
+[patch.crates-io]
+aws-lc-sys = { path = "patches/aws-lc-sys-0.40.0" }

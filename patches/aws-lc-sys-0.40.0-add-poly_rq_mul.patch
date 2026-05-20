@@ -1,0 +1,10 @@
+--- a/builder/cc_builder/linux_x86_64.rs
++++ b/builder/cc_builder/linux_x86_64.rs
+@@ -4,6 +4,7 @@
+ // Tue Apr 14 12:15:13 UTC 2026
+ 
+ pub(super) const CRYPTO_LIBRARY: &[&str] = &[
++    "crypto/hrss/asm/poly_rq_mul.S",
+     "crypto/fipsmodule/ml_kem/mlkem/native/x86_64/src/intt.S",
+     "crypto/fipsmodule/ml_kem/mlkem/native/x86_64/src/mulcache_compute.S",
+     "crypto/fipsmodule/ml_kem/mlkem/native/x86_64/src/ntt.S",
