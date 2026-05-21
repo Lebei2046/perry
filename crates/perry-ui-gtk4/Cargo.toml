@@ -13,6 +13,7 @@ perry-runtime = { path = "../perry-runtime" }
 perry-ffi = { path = "../perry-ffi" }
 base64 = "0.22"
 libc = "0.2"
+lazy_static = "1.4"
 gtk4 = { version = "0.9", features = ["v4_6"] }
 cairo-rs = "0.20"
 # perry/ui MapView (#517). libshumate is GNOME's GTK4-native vector-tile
@@ -32,6 +33,8 @@ webkit6 = "=0.4"
 dirs = "5"
 # perry/media — GStreamer playbin for streaming audio playback (#351).
 gstreamer = "0.25"
+gstreamer-app = "0.25"
+gstreamer-video = "0.25"
 # perry/media — MPRIS D-Bus exposure for GNOME / KDE / playerctl /
 # Bluetooth headphones (#366). Linux-only; zbus has Linux-specific
 # system deps that don't build on macOS / Windows hosts, so the crate

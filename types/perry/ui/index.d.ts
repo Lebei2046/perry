@@ -1296,6 +1296,24 @@ export function cameraSampleColor(x: number, y: number): number;
  */
 export function cameraSetOnTap(camera: Widget, callback: (x: number, y: number) => void): void;
 
+/**
+ * Register a callback for real-time camera frame processing.
+ * The callback receives raw frame data (BGRx format), width, and height.
+ * 
+ * Platform support:
+ *   - iOS:     AVFoundation capture session
+ *   - Android: CameraX / Camera2 API
+ *   - Linux:   GStreamer v4l2src
+ *   - Web:     MediaDevices.getUserMedia
+ *   - Other:   stub (callback never fires)
+ * 
+ * Requires camera permission.
+ */
+export function cameraRegisterFrameCallback(camera: Widget, callback: (frameData: Uint8Array, width: number, height: number) => void): void;
+
+/** Unregister the camera frame callback. */
+export function cameraUnregisterFrameCallback(camera: Widget): void;
+
 // ---------------------------------------------------------------------------
 // Sheet
 // ---------------------------------------------------------------------------
