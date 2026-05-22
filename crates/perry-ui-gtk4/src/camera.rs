@@ -6,10 +6,17 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Mutex;
 
 thread_local! {
     static CAMERA_VIEWS: RefCell<HashMap<i64, CameraViewData>> = RefCell::new(HashMap::new());
     static GST_INITIALIZED: RefCell<bool> = RefCell::new(false);
+}
+
+extern "C" {
+    fn js_closure_call3(closure: *const u8, arg1: f64, arg2: f64, arg3: f64) -> f64;
+    fn js_nanbox_get_pointer(value: f64) -> i64;
+    fn js_nanbox_pointer(ptr: i64) -> f64;
 }
 
 fn ensure_gst_init() -> Result<(), String> {
@@ -31,6 +38,8 @@ struct CameraViewData {
     is_frozen: AtomicBool,
     last_frame: RefCell<Option<(Vec<u8>, usize, usize)>>,
     receiver: Option<mpsc::Receiver<FrameData>>,
+    frame_callback: Mutex<Option<f64>>,
+    frame_count: std::sync::atomic::AtomicU64,
 }
 
 struct FrameData {
@@ -56,6 +65,8 @@ pub fn create() -> i64 {
         is_frozen: AtomicBool::new(false),
         last_frame: RefCell::new(None),
         receiver: None,
+        frame_callback: Mutex::new(None),
+        frame_count: std::sync::atomic::AtomicU64::new(0),
     };
 
     let handle = crate::widgets::register_widget(data.widget.clone());
@@ -173,6 +184,16 @@ fn schedule_frame_processing(handle: i64) {
 
                     *view.last_frame.borrow_mut() = Some((display_data.clone(), frame.width as usize, frame.height as usize));
 
+                    // Update frame count
+                    let count = view.frame_count.fetch_add(1, Ordering::Relaxed);
+
+                    // Clone for callback before display_data is moved
+                    let callback_data = if count % 30 == 0 && view.frame_callback.lock().unwrap().is_some() {
+                        Some(display_data.clone())
+                    } else {
+                        None
+                    };
+
                     let bytes = gtk4::glib::Bytes::from_owned(display_data);
                     let pixbuf = gdk_pixbuf::Pixbuf::from_bytes(
                         &bytes,
@@ -185,6 +206,19 @@ fn schedule_frame_processing(handle: i64) {
                     );
                     let texture = gdk::Texture::for_pixbuf(&pixbuf);
                     view.image.set_paintable(Some(&texture));
+
+                    // Invoke JS callback in a separate thread (every 30 frames to keep it light)
+                    if let Some(data) = callback_data {
+                        if let Some(callback) = *view.frame_callback.lock().unwrap() {
+                            let callback_clone = callback;
+                            let width = frame.width;
+                            let height = frame.height;
+
+                            std::thread::spawn(move || {
+                                invoke_frame_callback(callback_clone, &data, width, height);
+                            });
+                        }
+                    }
                 }
             }
 
@@ -498,8 +532,37 @@ pub fn sample_color(x: f64, y: f64) -> f64 {
 pub fn set_on_tap(_handle: i64, _callback: f64) {
 }
 
-pub fn register_frame_callback(_handle: i64, _callback: f64) {
+fn invoke_frame_callback(callback: f64, data: &[u8], width: i32, height: i32) {
+    let callback_ptr = unsafe { js_nanbox_get_pointer(callback) } as *const u8;
+    let data_ptr = unsafe { js_nanbox_pointer(data.as_ptr() as i64) };
+    let width_val = width as f64;
+    let height_val = height as f64;
+
+    unsafe {
+        js_closure_call3(callback_ptr, data_ptr, width_val, height_val);
+    }
 }
 
-pub fn unregister_frame_callback(_handle: i64) {
+pub fn register_frame_callback(handle: i64, callback: f64) {
+    eprintln!("[CameraView] register_frame_callback() handle: {}", handle);
+    CAMERA_VIEWS.with(|c| {
+        if let Some(view) = c.borrow_mut().get_mut(&handle) {
+            *view.frame_callback.lock().unwrap() = Some(callback);
+            eprintln!("[CameraView] Frame callback registered");
+        } else {
+            eprintln!("[CameraView] View not found for handle: {}", handle);
+        }
+    });
+}
+
+pub fn unregister_frame_callback(handle: i64) {
+    eprintln!("[CameraView] unregister_frame_callback() handle: {}", handle);
+    CAMERA_VIEWS.with(|c| {
+        if let Some(view) = c.borrow_mut().get_mut(&handle) {
+            *view.frame_callback.lock().unwrap() = None;
+            eprintln!("[CameraView] Frame callback unregistered");
+        } else {
+            eprintln!("[CameraView] View not found for handle: {}", handle);
+        }
+    });
 }
