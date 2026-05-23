@@ -17,6 +17,7 @@ extern "C" {
     fn js_closure_call3(closure: *const u8, arg1: f64, arg2: f64, arg3: f64) -> f64;
     fn js_nanbox_get_pointer(value: f64) -> i64;
     fn js_nanbox_pointer(ptr: i64) -> f64;
+    fn qrdecoder_process_frame(frame_data_ptr: i64, width: i32, height: i32);
 }
 
 fn ensure_gst_init() -> Result<(), String> {
@@ -24,7 +25,6 @@ fn ensure_gst_init() -> Result<(), String> {
         if !*i.borrow() {
             gstreamer::init().map_err(|e| format!("Failed to initialize GStreamer: {:?}", e))?;
             *i.borrow_mut() = true;
-            eprintln!("[CameraView] GStreamer initialized successfully");
         }
         Ok(())
     })
@@ -76,18 +76,14 @@ pub fn create() -> i64 {
 }
 
 pub fn start(handle: i64) {
-    eprintln!("[CameraView] start() called with handle: {}", handle);
-    
     CAMERA_VIEWS.with(|c| {
         let mut views = c.borrow_mut();
         
         let Some(view) = views.get_mut(&handle) else {
-            eprintln!("[CameraView] View not found for handle: {}", handle);
             return;
         };
 
         if view.is_running.load(Ordering::Relaxed) {
-            eprintln!("[CameraView] Camera already running");
             return;
         }
 
@@ -112,67 +108,63 @@ pub fn start(handle: i64) {
 
 fn schedule_frame_processing(handle: i64) {
     gtk4::glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
-        let mut should_continue = true;
-        
-        CAMERA_VIEWS.with(|c| {
-            let mut views = c.borrow_mut();
-            let Some(view) = views.get_mut(&handle) else {
-                should_continue = false;
-                return;
-            };
+        let should_continue = std::panic::catch_unwind(|| {
+            CAMERA_VIEWS.with(|c| {
+                let mut views = c.borrow_mut();
+                let Some(view) = views.get_mut(&handle) else {
+                    return false;
+                };
 
-            if !view.is_running.load(Ordering::Relaxed) {
-                should_continue = false;
-                return;
-            }
+                if !view.is_running.load(Ordering::Relaxed) {
+                    return false;
+                }
 
-            let receiver = match view.receiver.as_mut() {
-                Some(r) => r,
-                None => return,
-            };
+                let receiver = match view.receiver.as_mut() {
+                    Some(r) => r,
+                    None => return true,
+                };
 
-            while let Ok(frame) = receiver.try_recv() {
-                let running = view.is_running.load(Ordering::Relaxed);
-                let frozen = view.is_frozen.load(Ordering::Relaxed);
+                while let Ok(frame) = receiver.try_recv() {
+                    let running = view.is_running.load(Ordering::Relaxed);
+                    let frozen = view.is_frozen.load(Ordering::Relaxed);
 
-                if running && !frozen {
+                    if !running || frozen {
+                        continue;
+                    }
+
+                    if frame.data.is_empty() {
+                        continue;
+                    }
+
                     let (display_data, stride) = match frame.format.as_str() {
                         "YUY2" => {
-                            eprintln!("[CameraView] Converting YUY2 to RGB");
                             let rgb_data = yuy2_to_rgb(&frame.data, frame.width as usize, frame.height as usize);
                             (rgb_data, frame.width as usize * 3)
                         },
                         "BGR" => {
-                            eprintln!("[CameraView] Converting BGR to RGB");
                             let rgb_data = bgr_to_rgb(&frame.data);
                             (rgb_data, frame.width as usize * 3)
                         },
                         "BGRA" => {
-                            eprintln!("[CameraView] Converting BGRA to RGB");
                             let rgb_data = bgra_to_rgb(&frame.data, frame.width as usize, frame.height as usize, "BGRA");
                             (rgb_data, frame.width as usize * 3)
                         },
                         "ABGR" => {
-                            eprintln!("[CameraView] Converting ABGR to RGB");
                             let rgb_data = bgra_to_rgb(&frame.data, frame.width as usize, frame.height as usize, "ABGR");
                             (rgb_data, frame.width as usize * 3)
                         },
                         "RGB" => {
-                            eprintln!("[CameraView] Format is already RGB");
                             (frame.data.clone(), frame.width as usize * 3)
                         },
                         "RGB16" => {
-                            eprintln!("[CameraView] Converting RGB16 to RGB");
                             let rgb_data = rgb16_to_rgb(&frame.data);
                             (rgb_data, frame.width as usize * 3)
                         },
                         "NV12" => {
-                            eprintln!("[CameraView] Converting NV12 to RGB");
                             let rgb_data = nv12_to_rgb(&frame.data, frame.width as usize, frame.height as usize);
                             (rgb_data, frame.width as usize * 3)
                         },
                         "I420" => {
-                            eprintln!("[CameraView] Converting I420 to RGB");
                             let rgb_data = i420_to_rgb(&frame.data, frame.width as usize, frame.height as usize);
                             (rgb_data, frame.width as usize * 3)
                         },
@@ -181,20 +173,8 @@ fn schedule_frame_processing(handle: i64) {
                             continue;
                         },
                     };
-
-                    *view.last_frame.borrow_mut() = Some((display_data.clone(), frame.width as usize, frame.height as usize));
-
-                    // Update frame count
-                    let count = view.frame_count.fetch_add(1, Ordering::Relaxed);
-
-                    // Clone for callback before display_data is moved
-                    let callback_data = if count % 30 == 0 && view.frame_callback.lock().unwrap().is_some() {
-                        Some(display_data.clone())
-                    } else {
-                        None
-                    };
-
-                    let bytes = gtk4::glib::Bytes::from_owned(display_data);
+                    
+                    let bytes = gtk4::glib::Bytes::from_owned(display_data.clone());
                     let pixbuf = gdk_pixbuf::Pixbuf::from_bytes(
                         &bytes,
                         gdk_pixbuf::Colorspace::Rgb,
@@ -207,25 +187,28 @@ fn schedule_frame_processing(handle: i64) {
                     let texture = gdk::Texture::for_pixbuf(&pixbuf);
                     view.image.set_paintable(Some(&texture));
 
-                    // Invoke JS callback in a separate thread (every 30 frames to keep it light)
-                    if let Some(data) = callback_data {
-                        if let Some(callback) = *view.frame_callback.lock().unwrap() {
-                            let callback_clone = callback;
-                            let width = frame.width;
-                            let height = frame.height;
-
-                            std::thread::spawn(move || {
-                                invoke_frame_callback(callback_clone, &data, width, height);
-                            });
+                    *view.last_frame.borrow_mut() = Some((display_data, frame.width as usize, frame.height as usize));
+                    let count = view.frame_count.fetch_add(1, Ordering::Relaxed);
+                
+                    if count % 5 == 0 {
+                        let last_frame = view.last_frame.borrow();
+                        if let Some((data, w, h)) = last_frame.as_ref() {
+                            let data_ptr = data.as_ptr() as i64;
+                            unsafe {
+                                qrdecoder_process_frame(data_ptr, *w as i32, *h as i32);
+                            }
                         }
                     }
                 }
-            }
 
-            should_continue = view.is_running.load(Ordering::Relaxed);
+                view.is_running.load(Ordering::Relaxed)
+            })
         });
         
-        should_continue.into()
+        match should_continue {
+            Ok(val) => val.into(),
+            Err(_) => false.into(),
+        }
     });
 }
 
@@ -318,7 +301,6 @@ fn nv12_to_rgb(data: &[u8], width: usize, height: usize) -> Vec<u8> {
     let uv_size = width * height / 2;
     
     if data.len() < y_size + uv_size {
-        eprintln!("[CameraView] NV12 data too small");
         return rgb;
     }
     
@@ -354,7 +336,6 @@ fn i420_to_rgb(data: &[u8], width: usize, height: usize) -> Vec<u8> {
     let v_size = width * height / 4;
     
     if data.len() < y_size + u_size + v_size {
-        eprintln!("[CameraView] I420 data too small");
         return rgb;
     }
     
@@ -381,16 +362,11 @@ fn i420_to_rgb(data: &[u8], width: usize, height: usize) -> Vec<u8> {
 }
 
 fn create_pipeline(handle: i64, sender: mpsc::Sender<FrameData>) -> Result<gstreamer::Pipeline, String> {
-    eprintln!("[CameraView] create_pipeline() called");
-    
     ensure_gst_init()?;
 
-    eprintln!("[CameraView] Checking camera device...");
     if !camera_device_exists() {
-        eprintln!("[CameraView] No camera device found");
         return Err("No camera device found".to_string());
     }
-    eprintln!("[CameraView] Camera device found");
 
     let pipeline = gstreamer::Pipeline::new();
 
@@ -432,8 +408,6 @@ fn create_pipeline(handle: i64, sender: mpsc::Sender<FrameData>) -> Result<gstre
             let format = structure.get::<&str>("format").unwrap_or("UNKNOWN").to_string();
             let stride = structure.get::<i32>("stride").unwrap_or((width * 3) as i32);
             
-            eprintln!("[CameraView] Frame received: {}x{} format: {} stride: {}", width, height, format, stride);
-            
             let map = buffer.map_readable().map_err(|_| gstreamer::FlowError::Eos)?;
             let frame_data = map.as_slice().to_vec();
             
@@ -449,10 +423,8 @@ fn create_pipeline(handle: i64, sender: mpsc::Sender<FrameData>) -> Result<gstre
         })
         .build());
 
-    eprintln!("[CameraView] Starting pipeline...");
     pipeline.set_state(gstreamer::State::Playing)
         .map_err(|e| format!("Failed to start pipeline: {:?}", e))?;
-    eprintln!("[CameraView] Pipeline started");
 
     Ok(pipeline)
 }
@@ -480,11 +452,12 @@ pub fn stop(handle: i64) {
             return;
         };
 
+        view.is_running.store(false, Ordering::Relaxed);
+
         if let Some(pipeline) = view.pipeline.take() {
             pipeline.set_state(gstreamer::State::Null).ok();
         }
 
-        view.is_running.store(false, Ordering::Relaxed);
         view.is_frozen.store(false, Ordering::Relaxed);
     });
 }
@@ -532,37 +505,19 @@ pub fn sample_color(x: f64, y: f64) -> f64 {
 pub fn set_on_tap(_handle: i64, _callback: f64) {
 }
 
-fn invoke_frame_callback(callback: f64, data: &[u8], width: i32, height: i32) {
-    let callback_ptr = unsafe { js_nanbox_get_pointer(callback) } as *const u8;
-    let data_ptr = unsafe { js_nanbox_pointer(data.as_ptr() as i64) };
-    let width_val = width as f64;
-    let height_val = height as f64;
-
-    unsafe {
-        js_closure_call3(callback_ptr, data_ptr, width_val, height_val);
-    }
-}
-
 pub fn register_frame_callback(handle: i64, callback: f64) {
-    eprintln!("[CameraView] register_frame_callback() handle: {}", handle);
     CAMERA_VIEWS.with(|c| {
         if let Some(view) = c.borrow_mut().get_mut(&handle) {
             *view.frame_callback.lock().unwrap() = Some(callback);
-            eprintln!("[CameraView] Frame callback registered");
-        } else {
-            eprintln!("[CameraView] View not found for handle: {}", handle);
         }
     });
 }
 
 pub fn unregister_frame_callback(handle: i64) {
-    eprintln!("[CameraView] unregister_frame_callback() handle: {}", handle);
     CAMERA_VIEWS.with(|c| {
         if let Some(view) = c.borrow_mut().get_mut(&handle) {
             *view.frame_callback.lock().unwrap() = None;
-            eprintln!("[CameraView] Frame callback unregistered");
-        } else {
-            eprintln!("[CameraView] View not found for handle: {}", handle);
         }
     });
 }
+
