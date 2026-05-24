@@ -1314,9 +1314,6 @@ export function cameraRegisterFrameCallback(camera: Widget, callback: (frameData
 /** Unregister the camera frame callback. */
 export function cameraUnregisterFrameCallback(camera: Widget): void;
 
-/** Set the QR decoder session ID for direct frame processing. */
-export function cameraSetQrSessionId(camera: Widget, sessionId: number): void;
-
 // ---------------------------------------------------------------------------
 // Sheet
 // ---------------------------------------------------------------------------
