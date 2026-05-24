@@ -9,7 +9,7 @@ use std::sync::mpsc;
 use std::sync::Mutex;
 
 thread_local! {
-    static CAMERA_VIEWS: RefCell<HashMap<i64, CameraViewData>> = RefCell::new(HashMap::new());
+    static CAMERA_VIEWS: Mutex<HashMap<i64, CameraViewData>> = Mutex::new(HashMap::new());
     static GST_INITIALIZED: RefCell<bool> = RefCell::new(false);
 }
 
@@ -17,7 +17,6 @@ extern "C" {
     fn js_closure_call3(closure: *const u8, arg1: f64, arg2: f64, arg3: f64) -> f64;
     fn js_nanbox_get_pointer(value: f64) -> i64;
     fn js_nanbox_pointer(ptr: i64) -> f64;
-    fn qrdecoder_process_frame(frame_data_ptr: i64, width: i32, height: i32);
 }
 
 fn ensure_gst_init() -> Result<(), String> {
@@ -70,14 +69,14 @@ pub fn create() -> i64 {
     };
 
     let handle = crate::widgets::register_widget(data.widget.clone());
-    CAMERA_VIEWS.with(|c| c.borrow_mut().insert(handle, data));
+    CAMERA_VIEWS.with(|c| c.lock().unwrap().insert(handle, data));
 
     handle
 }
 
 pub fn start(handle: i64) {
     CAMERA_VIEWS.with(|c| {
-        let mut views = c.borrow_mut();
+        let mut views = c.lock().unwrap();
         
         let Some(view) = views.get_mut(&handle) else {
             return;
@@ -109,8 +108,9 @@ pub fn start(handle: i64) {
 fn schedule_frame_processing(handle: i64) {
     gtk4::glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
         let should_continue = std::panic::catch_unwind(|| {
-            CAMERA_VIEWS.with(|c| {
-                let mut views = c.borrow_mut();
+            let mut pending_callback: Option<(f64, i64, usize, usize)> = None;
+            let is_running = CAMERA_VIEWS.with(|c| {
+                let mut views = c.lock().unwrap();
                 let Some(view) = views.get_mut(&handle) else {
                     return false;
                 };
@@ -190,19 +190,36 @@ fn schedule_frame_processing(handle: i64) {
                     *view.last_frame.borrow_mut() = Some((display_data, frame.width as usize, frame.height as usize));
                     let count = view.frame_count.fetch_add(1, Ordering::Relaxed);
                 
-                    if count % 5 == 0 {
+                    // Collect callback info while holding the borrow, but don't call it yet!
+                    if let Some(callback) = view.frame_callback.lock().unwrap().as_ref() {
                         let last_frame = view.last_frame.borrow();
                         if let Some((data, w, h)) = last_frame.as_ref() {
-                            let data_ptr = data.as_ptr() as i64;
-                            unsafe {
-                                qrdecoder_process_frame(data_ptr, *w as i32, *h as i32);
+                            if *w > 0 && *h > 0 && !data.is_empty() {
+                                pending_callback = Some((*callback, data.as_ptr() as i64, *w, *h));
                             }
                         }
                     }
                 }
 
                 view.is_running.load(Ordering::Relaxed)
-            })
+            });
+
+            // Now defer the callback to GTK idle handler to completely avoid borrow conflicts!
+            if let Some((callback, data_ptr, w, h)) = pending_callback {
+                gtk4::glib::idle_add_once(move || {
+                    unsafe {
+                        let closure_ptr = js_nanbox_get_pointer(callback) as *const u8;
+                        js_closure_call3(
+                            closure_ptr,
+                            js_nanbox_pointer(data_ptr),
+                            w as f64,
+                            h as f64,
+                        );
+                    }
+                });
+            }
+
+            is_running
         });
         
         match should_continue {
@@ -447,7 +464,7 @@ fn camera_device_exists() -> bool {
 
 pub fn stop(handle: i64) {
     CAMERA_VIEWS.with(|c| {
-        let mut views = c.borrow_mut();
+        let mut views = c.lock().unwrap();
         let Some(view) = views.get_mut(&handle) else {
             return;
         };
@@ -464,7 +481,8 @@ pub fn stop(handle: i64) {
 
 pub fn freeze(handle: i64) {
     CAMERA_VIEWS.with(|c| {
-        if let Some(view) = c.borrow().get(&handle) {
+        let views = c.lock().unwrap();
+        if let Some(view) = views.get(&handle) {
             view.is_frozen.store(true, Ordering::Relaxed);
         }
     });
@@ -472,7 +490,8 @@ pub fn freeze(handle: i64) {
 
 pub fn unfreeze(handle: i64) {
     CAMERA_VIEWS.with(|c| {
-        if let Some(view) = c.borrow().get(&handle) {
+        let views = c.lock().unwrap();
+        if let Some(view) = views.get(&handle) {
             view.is_frozen.store(false, Ordering::Relaxed);
         }
     });
@@ -480,7 +499,8 @@ pub fn unfreeze(handle: i64) {
 
 pub fn sample_color(x: f64, y: f64) -> f64 {
     CAMERA_VIEWS.with(|c| {
-        for view in c.borrow().values() {
+        let views = c.lock().unwrap();
+        for view in views.values() {
             if view.is_running.load(Ordering::Relaxed) && !view.is_frozen.load(Ordering::Relaxed) {
                 if let Some((data, width, height)) = view.last_frame.borrow().as_ref() {
                     let px = (x * *width as f64) as usize;
@@ -507,7 +527,8 @@ pub fn set_on_tap(_handle: i64, _callback: f64) {
 
 pub fn register_frame_callback(handle: i64, callback: f64) {
     CAMERA_VIEWS.with(|c| {
-        if let Some(view) = c.borrow_mut().get_mut(&handle) {
+        let mut views = c.lock().unwrap();
+        if let Some(view) = views.get_mut(&handle) {
             *view.frame_callback.lock().unwrap() = Some(callback);
         }
     });
@@ -515,7 +536,8 @@ pub fn register_frame_callback(handle: i64, callback: f64) {
 
 pub fn unregister_frame_callback(handle: i64) {
     CAMERA_VIEWS.with(|c| {
-        if let Some(view) = c.borrow_mut().get_mut(&handle) {
+        let mut views = c.lock().unwrap();
+        if let Some(view) = views.get_mut(&handle) {
             *view.frame_callback.lock().unwrap() = None;
         }
     });
