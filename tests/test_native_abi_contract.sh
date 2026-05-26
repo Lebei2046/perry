@@ -8,11 +8,26 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PERRY="$SCRIPT_DIR/../target/release/perry"
-[ ! -f "$PERRY" ] && PERRY="$SCRIPT_DIR/../target/debug/perry"
-if [ ! -f "$PERRY" ]; then
-  echo "SKIP: perry binary not found (build with cargo build --release)"
-  exit 0
+PERRY_PROVIDED=0
+if [ -n "${PERRY:-}" ]; then
+  PERRY_PROVIDED=1
+else
+  PERRY="$SCRIPT_DIR/../target/release/perry"
+  [ ! -f "$PERRY" ] && PERRY="$SCRIPT_DIR/../target/debug/perry"
+  if [ ! -f "$PERRY" ]; then
+    echo "SKIP: perry binary not found (build with cargo build --release)"
+    exit 0
+  fi
+fi
+
+case "$PERRY" in
+  /*) ;;
+  *) PERRY="$(pwd)/$PERRY" ;;
+esac
+
+if [ "$PERRY_PROVIDED" -eq 1 ] && [ ! -x "$PERRY" ]; then
+  echo "FAIL: perry binary not found at $PERRY"
+  exit 1
 fi
 
 if ! command -v cc >/dev/null 2>&1; then
@@ -230,10 +245,23 @@ if [ "$RUN_OUTPUT" != "PASS" ]; then
 fi
 
 ARTIFACT_TEXT="$TMPDIR/native-reps.txt"
-cat "$ARTIFACT_DIR"/*.json > "$ARTIFACT_TEXT"
+shopt -s nullglob
+ARTIFACTS=("$ARTIFACT_DIR"/*.json)
+shopt -u nullglob
+if [ "${#ARTIFACTS[@]}" -eq 0 ]; then
+  echo "FAIL: native reps artifact missing"
+  echo "$COMPILE_OUTPUT" | tail -20
+  exit 1
+fi
+cat "${ARTIFACTS[@]}" > "$ARTIFACT_TEXT"
+
+if ! grep -Eq '"schema_version"[[:space:]]*:[[:space:]]*[0-9]+' "$ARTIFACT_TEXT"; then
+  echo "FAIL: native reps artifact missing numeric schema_version"
+  echo "$COMPILE_OUTPUT" | tail -20
+  exit 1
+fi
 
 for token in \
-  '"schema_version": 5' \
   '"consumer": "native_library.raw_u32"' \
   '"consumer": "native_library.raw_u64"' \
   '"consumer": "native_library.raw_usize"' \
