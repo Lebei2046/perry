@@ -2054,6 +2054,8 @@ declare module "util" {
   /** stdlib */
   export function isDeepStrictEqual(...args: any[]): any;
   /** stdlib */
+  export function parseArgs(...args: any[]): any;
+  /** stdlib */
   export function promisify(...args: any[]): any;
   /** stdlib */
   export function stripVTControlCharacters(...args: any[]): any;

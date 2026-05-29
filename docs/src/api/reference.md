@@ -1977,6 +1977,7 @@ Total: 1489 entries across 82 modules.
 - `inherits` — module
 - `inspect` — module
 - `isDeepStrictEqual` — module
+- `parseArgs` — module
 - `promisify` — module
 - `stripVTControlCharacters` — module
 

@@ -2385,6 +2385,7 @@ pub static API_MANIFEST: &[ApiEntry] = &[
     method("util", "deprecate", false, None),
     method("util", "inherits", false, None),
     method("util", "isDeepStrictEqual", false, None),
+    method("util", "parseArgs", false, None),
     method("util", "stripVTControlCharacters", false, None),
     class("util", "TextEncoder"),
     class("util", "TextDecoder"),

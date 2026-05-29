@@ -494,6 +494,7 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_util_promisify", DOUBLE, &[DOUBLE]);
     module.declare_function("js_util_callbackify", DOUBLE, &[DOUBLE]);
     module.declare_function("js_util_deprecate", DOUBLE, &[DOUBLE, DOUBLE, DOUBLE]);
+    module.declare_function("js_util_parse_args", DOUBLE, &[DOUBLE]);
     module.declare_function("js_boxed_number_new", DOUBLE, &[DOUBLE]);
     module.declare_function("js_boxed_string_new", DOUBLE, &[DOUBLE]);
     module.declare_function("js_boxed_boolean_new", DOUBLE, &[DOUBLE]);
