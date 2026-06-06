@@ -914,6 +914,12 @@ pub(crate) fn infer_call_return_type(callee: &ast::Expr, ctx: &LoweringContext) 
                 return Type::Promise(Box::new(dir_type()));
             }
             if matches!(
+                ctx.lookup_native_module(name),
+                Some((module, Some("opendirSync"))) if is_fs_module(module)
+            ) {
+                return dir_type();
+            }
+            if matches!(
                 ctx.lookup_builtin_named_import(name),
                 Some((module, "open")) if is_fs_promises_module(module)
             ) {
