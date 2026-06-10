@@ -173,8 +173,30 @@ cargo build --release
 
 Perry requires a C linker to link compiled executables:
 - **macOS:** Xcode Command Line Tools (`xcode-select --install`)
-- **Linux:** GCC or Clang (`sudo apt install build-essential`)
+- **Linux:** GCC or Clang (see below for your distro)
 - **Windows:** MSVC (Visual Studio Build Tools)
+
+Linux linker by distro:
+
+```bash
+# Debian / Ubuntu / Pop!_OS / Mint
+sudo apt install build-essential
+
+# Arch / Manjaro / CachyOS / EndeavourOS
+sudo pacman -S base-devel gcc
+
+# Fedora / RHEL / CentOS Stream
+sudo dnf install gcc gcc-c++ glibc-devel
+
+# openSUSE
+sudo zypper install -t pattern devel_basis
+
+# Alpine / musl-based
+sudo apk add build-base
+
+# Void Linux
+sudo xbps-install -S base-devel
+```
 
 Run `perry doctor` to verify your environment.
 
